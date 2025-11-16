@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Commands\Calibrate.fs" />
+    <Compile Include="Commands\Debayer.fs" />
+    <Compile Include="Commands\Align.fs" />
+    <Compile Include="Commands\Integrate.fs" />
+    <Compile Include="Commands\Stats.fs" />
+    <Compile Include="Commands\Convert.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog" Version="4.3.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+  </ItemGroup>
+
+</Project>
