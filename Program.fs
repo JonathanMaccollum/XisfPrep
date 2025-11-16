@@ -2,8 +2,11 @@
 open Serilog.Events
 open System
 
-let configureLogging (verbose: bool) =
-    let level = if verbose then LogEventLevel.Verbose else LogEventLevel.Information
+let configureLogging (verbose: bool) (quiet: bool) =
+    let level =
+        if quiet then LogEventLevel.Error
+        elif verbose then LogEventLevel.Verbose
+        else LogEventLevel.Information
 
     Log.Logger <-
         LoggerConfiguration()
@@ -23,20 +26,34 @@ let showUsage() =
     printfn "  integrate   Stack/combine multiple images"
     printfn "  stats       Calculate image statistics"
     printfn "  convert     Format conversion and export"
+    printfn "  bin         Downsample images by binning pixels"
     printfn ""
     printfn "Global options:"
     printfn "  --verbose, -v    Enable verbose diagnostic output"
+    printfn "  --quiet, -q      Suppress all output except errors"
     printfn "  --help, -h       Show help information"
     printfn ""
     printfn "Run 'xisfprep <command> --help' for command-specific help"
 
+let commandHandlers =
+    Map.ofList [
+        "calibrate", Commands.Calibrate.run
+        "debayer", Commands.Debayer.run
+        "align", Commands.Align.run
+        "integrate", Commands.Integrate.run
+        "stats", Commands.Stats.run
+        "convert", Commands.Convert.run
+        "bin", Commands.Bin.run
+    ]
+
 [<EntryPoint>]
 let main argv =
-    // Parse for verbose flag
+    // Parse for global flags
     let verbose = argv |> Array.contains "--verbose" || argv |> Array.contains "-v"
+    let quiet = argv |> Array.contains "--quiet" || argv |> Array.contains "-q"
     let help = argv |> Array.contains "--help" || argv |> Array.contains "-h"
 
-    configureLogging verbose
+    configureLogging verbose quiet
 
     Log.Verbose("Verbose logging enabled")
     Log.Verbose("Command line args: {Args}", argv)
@@ -46,23 +63,21 @@ let main argv =
         argv
         |> Array.tryFind (fun arg -> not (arg.StartsWith("-")))
 
+    // Filter out command name and global flags to get command-specific args
+    let getCommandArgs cmdName =
+        let globalFlags = Set.ofList ["--verbose"; "-v"; "--quiet"; "-q"]
+        argv
+        |> Array.filter (fun arg -> arg <> cmdName && not (globalFlags.Contains arg))
+
     match command with
     | None ->
         showUsage()
         0
-    | Some "calibrate" ->
-        Commands.Calibrate.run argv
-    | Some "debayer" ->
-        Commands.Debayer.run argv
-    | Some "align" ->
-        Commands.Align.run argv
-    | Some "integrate" ->
-        Commands.Integrate.run argv
-    | Some "stats" ->
-        Commands.Stats.run argv
-    | Some "convert" ->
-        Commands.Convert.run argv
     | Some cmd ->
-        Log.Error("Unknown command: {Command}", cmd)
-        showUsage()
-        1
+        match Map.tryFind cmd commandHandlers with
+        | Some handler ->
+            handler (getCommandArgs cmd)
+        | None ->
+            Log.Error("Unknown command: {Command}", cmd)
+            showUsage()
+            1

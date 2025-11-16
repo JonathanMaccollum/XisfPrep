@@ -12,12 +12,17 @@
     <Compile Include="Commands\Integrate.fs" />
     <Compile Include="Commands\Stats.fs" />
     <Compile Include="Commands\Convert.fs" />
+    <Compile Include="Commands\Bin.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Serilog" Version="4.3.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\XisfLib.Core\XisfLib.Core.csproj" />
   </ItemGroup>
 
 </Project>
