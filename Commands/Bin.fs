@@ -272,17 +272,12 @@ let run (args: string array) =
                         printfn $"Found {files.Length} files to process"
                         printfn ""
 
-                        // Process files in chunks based on parallel count
-                        let chunks = files |> Array.chunkBySize maxParallel
-                        let mutable allResults = []
+                        // Process all files in parallel with max parallelism limit
+                        let tasks = files |> Array.map (fun f -> binImage f outputDir factor method suffix overwrite)
+                        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = maxParallel)
 
-                        for chunk in chunks do
-                            let tasks = chunk |> Array.map (fun f -> binImage f outputDir factor method suffix overwrite)
-                            let! results = Async.Parallel tasks
-                            allResults <- allResults @ (Array.toList results)
-
-                        let successCount = allResults |> List.filter id |> List.length
-                        let failCount = allResults.Length - successCount
+                        let successCount = results |> Array.filter id |> Array.length
+                        let failCount = results.Length - successCount
 
                         printfn ""
                         printfn $"Completed: {successCount} succeeded, {failCount} failed"
