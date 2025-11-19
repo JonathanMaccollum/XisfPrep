@@ -24,6 +24,8 @@ type SortBy =
     | ByMAD
     | ByFWHM
     | ByStars
+    | ByExposure
+    | ByDate
 
 type SortOrder =
     | Ascending
@@ -53,9 +55,18 @@ type ImageStats = {
     Object: string option
     Filter: string option
     ImageType: string option
+    ExposureTime: float option
+    ObservationDate: DateTime option
+    SideOfPier: string option
     // Star detection results
     StarCount: int option
     MedianFWHM: float option
+}
+
+type AnalysisResult = {
+    FilePath: string
+    Stats: ImageStats option
+    Error: string option
 }
 
 let showHelp() =
@@ -68,6 +79,9 @@ let showHelp() =
     printfn ""
     printfn "Optional:"
     printfn "  --output, -o <file>       Output CSV file path"
+    printfn "  --header-only             Fast metadata-only mode (10-100x faster)"
+    printfn "                              - No pixel statistics or star detection"
+    printfn "                              - Ideal for inventory and session planning"
     printfn "  --metrics <level>         Statistics to calculate (default: basic)"
     printfn "                              basic     - Mean, median, stddev, min, max"
     printfn "                              all       - Basic + MAD, SNR, FITS metadata"
@@ -79,34 +93,41 @@ let showHelp() =
     printfn "                              target,filter  - Group by target, then filter"
     printfn "                              imagetype      - Group by frame type"
     printfn "  --sort-by <metric>        Sort within groups (default: name)"
-    printfn "                              name, median, snr, mad, fwhm, stars"
+    printfn "                              name, median, snr, mad, fwhm, stars, exposure, date"
     printfn "  --sort-order <dir>        Sort direction: asc or desc (auto default)"
     printfn "  --min-median <value>      Filter out frames below median threshold"
     printfn "  --max-mad <value>         Filter out frames above MAD threshold"
     printfn "  --min-snr <value>         Filter out frames below SNR threshold"
     printfn ""
     printfn "Examples:"
+    printfn "  # Pixel analysis with quality metrics"
     printfn "  xisfprep stats -i \"images/*.xisf\" --metrics all --group-by target,filter"
     printfn "  xisfprep stats -i \"Ha*.xisf\" --metrics all --sort-by snr --sort-order desc"
     printfn "  xisfprep stats -i \"*.xisf\" --detect-stars --sort-by fwhm --min-median 500"
+    printfn ""
+    printfn "  # Fast header-only analysis"
+    printfn "  xisfprep stats -i \"session/*.xisf\" --header-only --group-by target,filter"
+    printfn "  xisfprep stats -i \"archive/**/*.xisf\" --header-only -o inventory.csv"
 
 let parseArgs (args: string array) =
-    let rec parse (args: string list) input output metrics detectStars groupBy sortBy sortOrder minMedian maxMad minSnr =
+    let rec parse (args: string list) input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr =
         match args with
-        | [] -> (input, output, metrics, detectStars, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
+        | [] -> (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output metrics detectStars groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest (Some value) output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) metrics detectStars groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest input (Some value) metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
+        | "--header-only" :: rest ->
+            parse rest input output metrics detectStars true groupBy sortBy sortOrder minMedian maxMad minSnr
         | "--metrics" :: value :: rest ->
             let level = match value.ToLower() with
                         | "basic" -> Basic
                         | "histogram" -> Histogram
                         | "all" -> All
                         | _ -> failwithf "Unknown metrics level: %s" value
-            parse rest input output (Some level) detectStars groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest input output (Some level) detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
         | "--detect-stars" :: rest ->
-            parse rest input output metrics true groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest input output metrics true headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
         | "--group-by" :: value :: rest ->
             let group = match value.ToLower() with
                         | "target" -> ByTarget
@@ -114,7 +135,7 @@ let parseArgs (args: string array) =
                         | "target,filter" | "targetfilter" -> ByTargetAndFilter
                         | "imagetype" -> ByImageType
                         | _ -> failwithf "Unknown grouping: %s" value
-            parse rest input output metrics detectStars (Some group) sortBy sortOrder minMedian maxMad minSnr
+            parse rest input output metrics detectStars headerOnly (Some group) sortBy sortOrder minMedian maxMad minSnr
         | "--sort-by" :: value :: rest ->
             let sort = match value.ToLower() with
                        | "name" -> ByName
@@ -123,28 +144,43 @@ let parseArgs (args: string array) =
                        | "mad" -> ByMAD
                        | "fwhm" -> ByFWHM
                        | "stars" -> ByStars
+                       | "exposure" -> ByExposure
+                       | "date" -> ByDate
                        | _ -> failwithf "Unknown sort metric: %s" value
-            parse rest input output metrics detectStars groupBy (Some sort) sortOrder minMedian maxMad minSnr
+            parse rest input output metrics detectStars headerOnly groupBy (Some sort) sortOrder minMedian maxMad minSnr
         | "--sort-order" :: value :: rest ->
             let order = match value.ToLower() with
                         | "asc" | "ascending" -> Ascending
                         | "desc" | "descending" -> Descending
                         | _ -> failwithf "Unknown sort order: %s" value
-            parse rest input output metrics detectStars groupBy sortBy (Some order) minMedian maxMad minSnr
+            parse rest input output metrics detectStars headerOnly groupBy sortBy (Some order) minMedian maxMad minSnr
         | "--min-median" :: value :: rest ->
             let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars groupBy sortBy sortOrder (Some threshold) maxMad minSnr
+            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder (Some threshold) maxMad minSnr
         | "--max-mad" :: value :: rest ->
             let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars groupBy sortBy sortOrder minMedian (Some threshold) minSnr
+            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian (Some threshold) minSnr
         | "--min-snr" :: value :: rest ->
             let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars groupBy sortBy sortOrder minMedian maxMad (Some threshold)
+            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad (Some threshold)
         | arg :: rest ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, metrics, detectStars, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) =
-        parse (List.ofArray args) None None None false None None None None None None
+    let (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) =
+        parse (List.ofArray args) None None None false false None None None None None None
+
+    // Validate incompatible options
+    if headerOnly && detectStars then
+        failwith "--header-only and --detect-stars are incompatible (star detection requires pixel data)"
+
+    if headerOnly && (minMedian.IsSome || maxMad.IsSome || minSnr.IsSome) then
+        failwith "--header-only is incompatible with --min-median, --max-mad, and --min-snr (require pixel statistics)"
+
+    if headerOnly then
+        match sortBy with
+        | Some (ByMedian | BySNR | ByMAD | ByFWHM | ByStars) ->
+            failwith "--header-only is incompatible with --sort-by median/snr/mad/fwhm/stars (require pixel statistics). Use --sort-by name/exposure/date instead."
+        | _ -> ()
 
     let input = match input with Some v -> v | None -> failwith "Required argument: --input"
     let metrics = metrics |> Option.defaultValue Basic
@@ -157,10 +193,10 @@ let parseArgs (args: string array) =
         | Some order -> order
         | None ->
             match sortBy with
-            | ByMedian | BySNR | ByStars -> Descending  // Higher is better
-            | ByMAD | ByFWHM | ByName -> Ascending      // Lower is better
+            | ByMedian | BySNR | ByStars | ByExposure -> Descending  // Higher is better
+            | ByMAD | ByFWHM | ByName | ByDate -> Ascending          // Lower is better
 
-    (input, output, metrics, detectStars, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
+    (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
 
 let calculateStats (values: float[]) =
     if Array.isEmpty values then
@@ -253,7 +289,132 @@ let formatFileSize (bytes: int64) =
     else
         sprintf "%.2f GB" (float bytes / (1024.0 * 1024.0 * 1024.0))
 
-let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: bool) : Async<ImageStats option> =
+// ==================== Metadata Extraction Helpers ====================
+
+module MetadataExtraction =
+    let tryGetProperty (name: string) (props: XisfProperty seq) =
+        props
+        |> Seq.tryFind (fun p -> p.Id = name)
+        |> Option.bind (fun p ->
+            match p with
+            | :? XisfStringProperty as sp -> Some sp.Value
+            | _ -> None)
+
+    let tryGetNumericProperty (name: string) (props: XisfProperty seq) =
+        props
+        |> Seq.tryFind (fun p -> p.Id = name)
+        |> Option.bind (fun p ->
+            match p with
+            | :? XisfScalarProperty<single> as fp -> Some (float fp.Value)
+            | :? XisfScalarProperty<double> as dp -> Some dp.Value
+            | :? XisfScalarProperty<int> as ip -> Some (float ip.Value)
+            | :? XisfScalarProperty<uint32> as up -> Some (float up.Value)
+            | :? XisfStringProperty as sp ->
+                match Double.TryParse(sp.Value) with
+                | true, v -> Some v
+                | false, _ -> None
+            | _ -> None)
+
+    let tryGetFitsKeyword (name: string) (elements: XisfCoreElement seq) =
+        elements
+        |> Seq.tryPick (fun e ->
+            match e with
+            | :? XisfFitsKeyword as fk when fk.Name = name -> Some fk.Value
+            | _ -> None)
+
+    let tryParseDate (value: string) =
+        match DateTime.TryParse(value.Trim('\'', ' ')) with
+        | true, d -> Some d
+        | false, _ -> None
+
+    let extractFromMetadata (metadata: XisfMetadataUnit) =
+        let allElements =
+            if metadata.Images.Count > 0 && not (isNull metadata.Images.[0].AssociatedElements) then
+                metadata.Images.[0].AssociatedElements :> XisfCoreElement seq
+            else
+                Seq.empty
+
+        let allProps =
+            let globalProps = metadata.GlobalProperties :> XisfProperty seq
+            let imageProps =
+                if metadata.Images.Count > 0 && not (isNull metadata.Images.[0].Properties) then
+                    metadata.Images.[0].Properties :> XisfProperty seq
+                else
+                    Seq.empty
+            Seq.append globalProps imageProps
+
+        let object' =
+            tryGetProperty "Observation:Object:Name" allProps
+            |> Option.orElse (tryGetProperty "OBJECT" allProps)
+
+        let filter =
+            tryGetProperty "Instrument:Filter:Name" allProps
+            |> Option.orElse (tryGetProperty "FILTER" allProps)
+
+        let imageType =
+            tryGetFitsKeyword "IMAGETYP" allElements
+            |> Option.map (fun v -> v.Trim('\'', ' ').ToUpper())
+
+        let exposureTime =
+            tryGetNumericProperty "Instrument:ExposureTime" allProps
+
+        let observationDate =
+            tryGetFitsKeyword "DATE-OBS" allElements
+            |> Option.bind tryParseDate
+
+        let sideOfPier =
+            tryGetProperty "Instrument:Telescope:SideOfPier" allProps
+            |> Option.orElse (tryGetFitsKeyword "PIERSIDE" allElements |> Option.map (fun v -> v.Trim('\'', ' ')))
+
+        (object', filter, imageType, exposureTime, observationDate, sideOfPier)
+
+// ==================== Image Analysis Functions ====================
+
+let analyzeImageMetadata (filePath: string) : Async<AnalysisResult> =
+    async {
+        try
+            let fileName = Path.GetFileName(filePath)
+            let fileInfo = FileInfo(filePath)
+            let fileSize = fileInfo.Length
+
+            let reader = new XisfReader()
+            let metadata = reader.ReadMetadataFromFile(filePath)
+
+            if metadata.Images.Count = 0 then
+                return { FilePath = filePath; Stats = None; Error = Some "No images found in file" }
+            else
+                let img = metadata.Images.[0]
+                let (object', filter, imageType, exposureTime, observationDate, sideOfPier) =
+                    MetadataExtraction.extractFromMetadata metadata
+
+                let compression =
+                    match img.DataBlockInfo.Compression with
+                    | null -> "none"
+                    | comp -> comp.ToString()
+
+                let stats = {
+                    FileName = fileName
+                    Width = int img.Geometry.Width
+                    Height = int img.Geometry.Height
+                    Channels = int img.Geometry.ChannelCount
+                    ChannelStats = [||]  // No pixel statistics in header-only mode
+                    FileSize = fileSize
+                    Compression = compression
+                    Object = object'
+                    Filter = filter
+                    ImageType = imageType
+                    ExposureTime = exposureTime
+                    ObservationDate = observationDate
+                    SideOfPier = sideOfPier
+                    StarCount = None
+                    MedianFWHM = None
+                }
+                return { FilePath = filePath; Stats = Some stats; Error = None }
+        with ex ->
+            return { FilePath = filePath; Stats = None; Error = Some ex.Message }
+    }
+
+let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: bool) : Async<AnalysisResult> =
     async {
         try
             let fileName = Path.GetFileName(filePath)
@@ -268,6 +429,29 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
             let object = extractFitsKeyword img "OBJECT"
             let filter = extractFitsKeyword img "FILTER"
             let imageType = extractFitsKeyword img "IMAGETYP"
+
+            // Extract additional metadata (exposure, date, pier side)
+            let allProps =
+                let globalProps = unit.GlobalProperties :> XisfProperty seq
+                let imageProps =
+                    if not (isNull img.Properties) then
+                        img.Properties :> XisfProperty seq
+                    else
+                        Seq.empty
+                Seq.append globalProps imageProps
+
+            let exposureTime = MetadataExtraction.tryGetNumericProperty "Instrument:ExposureTime" allProps
+
+            let observationDate =
+                extractFitsKeyword img "DATE-OBS"
+                |> Option.bind (fun v ->
+                    match DateTime.TryParse(v.Trim('\'', ' ')) with
+                    | true, d -> Some d
+                    | false, _ -> None)
+
+            let sideOfPier =
+                MetadataExtraction.tryGetProperty "Instrument:Telescope:SideOfPier" allProps
+                |> Option.orElse (extractFitsKeyword img "PIERSIDE")
 
             let compression =
                 if img.PixelData :? InlineDataBlock then
@@ -375,7 +559,7 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
                 else
                     (None, None)
 
-            return Some {
+            let stats = {
                 FileName = fileName
                 Width = width
                 Height = height
@@ -386,12 +570,15 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
                 Object = object
                 Filter = filter
                 ImageType = imageType
+                ExposureTime = exposureTime
+                ObservationDate = observationDate
+                SideOfPier = sideOfPier
                 StarCount = starCount
                 MedianFWHM = medianFWHM
             }
+            return { FilePath = filePath; Stats = Some stats; Error = None }
         with ex ->
-            Log.Error($"Error processing {Path.GetFileName(filePath)}: {ex.Message}")
-            return None
+            return { FilePath = filePath; Stats = None; Error = Some ex.Message }
     }
 
 let applyFilters (stats: ImageStats[]) (minMedian: float option) (maxMad: float option) (minSnr: float option) : ImageStats[] =
@@ -444,6 +631,14 @@ let sortStats (stats: ImageStats[]) (sortBy: SortBy) (sortOrder: SortOrder) : Im
             let starsA = a.StarCount |> Option.defaultValue 0
             let starsB = b.StarCount |> Option.defaultValue 0
             compare starsA starsB
+        | ByExposure -> fun a b ->
+            let expA = a.ExposureTime |> Option.defaultValue 0.0
+            let expB = b.ExposureTime |> Option.defaultValue 0.0
+            compare expA expB
+        | ByDate -> fun a b ->
+            let dateA = a.ObservationDate |> Option.defaultValue DateTime.MinValue
+            let dateB = b.ObservationDate |> Option.defaultValue DateTime.MinValue
+            compare dateA dateB
 
     let sorted = stats |> Array.sortWith compareFunc
     match sortOrder with
@@ -473,6 +668,99 @@ let groupStats (stats: ImageStats[]) (groupBy: GroupBy) : (string * ImageStats[]
         stats
         |> Array.groupBy (fun s -> s.ImageType |> Option.defaultValue "Unknown Type")
         |> Array.sortBy fst
+
+type GroupAggregate = {
+    FrameCount: int
+    TotalIntegration: float
+    AverageExposure: float
+    DateRange: (DateTime * DateTime) option
+    TotalFileSize: int64
+}
+
+let calculateGroupAggregate (stats: ImageStats[]) : GroupAggregate =
+    let frameCount = stats.Length
+
+    let totalIntegration =
+        stats
+        |> Array.choose (fun s -> s.ExposureTime)
+        |> Array.sum
+
+    let averageExposure =
+        if frameCount > 0 then totalIntegration / float frameCount
+        else 0.0
+
+    let dates =
+        stats
+        |> Array.choose (fun s -> s.ObservationDate)
+        |> Array.sort
+
+    let dateRange =
+        if dates.Length > 0 then
+            Some (dates.[0], dates.[dates.Length - 1])
+        else
+            None
+
+    let totalFileSize =
+        stats |> Array.sumBy (fun s -> s.FileSize)
+
+    {
+        FrameCount = frameCount
+        TotalIntegration = totalIntegration
+        AverageExposure = averageExposure
+        DateRange = dateRange
+        TotalFileSize = totalFileSize
+    }
+
+let formatDuration (seconds: float) =
+    let totalMinutes = int (seconds / 60.0)
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
+
+    if hours > 0 then
+        sprintf "%dh %dm" hours minutes
+    else
+        sprintf "%dm" minutes
+
+let formatDateRange (dateRange: (DateTime * DateTime) option) =
+    match dateRange with
+    | None -> "No dates"
+    | Some (first, last) when first = last ->
+        first.ToString("yyyy-MM-dd")
+    | Some (first, last) ->
+        sprintf "%s to %s" (first.ToString("yyyy-MM-dd")) (last.ToString("yyyy-MM-dd"))
+
+let printStatsHeaderOnly (stats: ImageStats[]) (groupBy: GroupBy) (sortBy: SortBy) (sortOrder: SortOrder) =
+    printfn ""
+    printfn "Image Statistics (Header-Only Mode):"
+    printfn "================================================================================"
+
+    let groups = groupStats stats groupBy
+    let sortedGroups =
+        groups |> Array.map (fun (groupName, groupStats) ->
+            (groupName, sortStats groupStats sortBy sortOrder))
+
+    for (groupName, groupStats) in sortedGroups do
+        let aggregate = calculateGroupAggregate groupStats
+
+        printfn ""
+        printfn "================================================================================"
+        printfn "GROUP: %s" groupName
+        printfn "================================================================================"
+        printfn "  Frames:             %d" aggregate.FrameCount
+        printfn "  Total Integration:  %s (%.0f seconds)" (formatDuration aggregate.TotalIntegration) aggregate.TotalIntegration
+        printfn "  Average Exposure:   %.2f seconds" aggregate.AverageExposure
+        printfn "  Date Range:         %s" (formatDateRange aggregate.DateRange)
+        printfn "  Total Size:         %s" (formatFileSize aggregate.TotalFileSize)
+
+        if groupBy = NoGrouping then
+            printfn ""
+            printfn "Files:"
+            printfn "--------------------------------------------------------------------------------"
+            for imgStats in groupStats do
+                let exposure = imgStats.ExposureTime |> Option.map (sprintf "%.0fs") |> Option.defaultValue "-"
+                let date = imgStats.ObservationDate |> Option.map (fun d -> d.ToString("yyyy-MM-dd HH:mm")) |> Option.defaultValue "-"
+                let size = formatFileSize imgStats.FileSize
+                printfn "  %-60s  %8s  %16s  %10s" imgStats.FileName exposure date size
 
 let printStats (stats: ImageStats[]) (groupBy: GroupBy) (sortBy: SortBy) (sortOrder: SortOrder) =
     printfn ""
@@ -570,6 +858,9 @@ let printStats (stats: ImageStats[]) (groupBy: GroupBy) (sortBy: SortBy) (sortOr
 let writeCsv (outputPath: string) (stats: ImageStats[]) =
     use writer = new StreamWriter(outputPath)
 
+    let isHeaderOnly =
+        stats.Length > 0 && stats.[0].ChannelStats.Length = 0
+
     let hasAdvanced =
         stats.Length > 0 &&
         stats.[0].ChannelStats.Length > 0 &&
@@ -581,7 +872,6 @@ let writeCsv (outputPath: string) (stats: ImageStats[]) =
         stats.[0].ChannelStats.[0].Histogram.IsSome
 
     let hasFitsMetadata =
-        hasAdvanced &&
         stats.Length > 0 &&
         (stats.[0].Object.IsSome || stats.[0].Filter.IsSome || stats.[0].ImageType.IsSome)
 
@@ -589,86 +879,116 @@ let writeCsv (outputPath: string) (stats: ImageStats[]) =
         stats.Length > 0 &&
         (stats.[0].StarCount.IsSome || stats.[0].MedianFWHM.IsSome)
 
-    let baseHeader =
-        if hasAdvanced then
-            let metadata = if hasFitsMetadata then ",Object,Filter,ImageType" else ""
-            let starData = if hasStarData then ",StarCount,MedianFWHM" else ""
-            sprintf "FileName,Width,Height,Channels,FileSize,Compression%s%s,Channel,Min,Max,Mean,Median,StdDev,MAD,SNR" metadata starData
-        else
-            "FileName,Width,Height,Channels,Channel,Min,Max,Mean,Median,StdDev"
+    if isHeaderOnly then
+        let metadata = if hasFitsMetadata then ",Object,Filter,ImageType" else ""
+        let header = sprintf "FileName,Width,Height,Channels,FileSize,Compression%s,ExposureTime,ObservationDate,SideOfPier" metadata
+        writer.WriteLine(header)
 
-    if hasHistogram then
-        let binCount = stats.[0].ChannelStats.[0].Histogram.Value.Length
-        let histHeaders = [0 .. binCount - 1] |> List.map (sprintf "Bin%d") |> String.concat ","
-        writer.WriteLine($"{baseHeader},{histHeaders}")
+        for imgStats in stats do
+            let metadataStr =
+                if hasFitsMetadata then
+                    let obj = imgStats.Object |> Option.defaultValue ""
+                    let flt = imgStats.Filter |> Option.defaultValue ""
+                    let typ = imgStats.ImageType |> Option.defaultValue ""
+                    sprintf ",%s,%s,%s" obj flt typ
+                else ""
+
+            let exposure = imgStats.ExposureTime |> Option.map string |> Option.defaultValue ""
+            let obsDate = imgStats.ObservationDate |> Option.map (fun d -> d.ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue ""
+            let pier = imgStats.SideOfPier |> Option.defaultValue ""
+
+            writer.WriteLine(sprintf "%s,%d,%d,%d,%d,%s%s,%s,%s,%s"
+                imgStats.FileName
+                imgStats.Width
+                imgStats.Height
+                imgStats.Channels
+                imgStats.FileSize
+                imgStats.Compression
+                metadataStr
+                exposure
+                obsDate
+                pier)
     else
-        writer.WriteLine(baseHeader)
+        let baseHeader =
+            if hasAdvanced then
+                let metadata = if hasFitsMetadata then ",Object,Filter,ImageType" else ""
+                let starData = if hasStarData then ",StarCount,MedianFWHM" else ""
+                sprintf "FileName,Width,Height,Channels,FileSize,Compression%s%s,Channel,Min,Max,Mean,Median,StdDev,MAD,SNR" metadata starData
+            else
+                "FileName,Width,Height,Channels,Channel,Min,Max,Mean,Median,StdDev"
 
-    for imgStats in stats do
-        for ch in imgStats.ChannelStats do
-            let channelName =
-                if imgStats.Channels = 1 then "Mono"
-                elif imgStats.Channels = 3 then
-                    match ch.Channel with
-                    | 0 -> "Red"
-                    | 1 -> "Green"
-                    | 2 -> "Blue"
-                    | _ -> sprintf "Ch%d" ch.Channel
-                else sprintf "Ch%d" ch.Channel
+        if hasHistogram then
+            let binCount = stats.[0].ChannelStats.[0].Histogram.Value.Length
+            let histHeaders = [0 .. binCount - 1] |> List.map (sprintf "Bin%d") |> String.concat ","
+            writer.WriteLine($"{baseHeader},{histHeaders}")
+        else
+            writer.WriteLine(baseHeader)
 
-            let basicStats =
-                if hasAdvanced then
-                    let madVal = ch.MAD |> Option.defaultValue 0.0
-                    let snrVal = ch.SNR |> Option.defaultValue 0.0
-                    let metadataStr =
-                        if hasFitsMetadata then
-                            let obj = imgStats.Object |> Option.defaultValue ""
-                            let flt = imgStats.Filter |> Option.defaultValue ""
-                            let typ = imgStats.ImageType |> Option.defaultValue ""
-                            sprintf ",%s,%s,%s" obj flt typ
-                        else ""
-                    let starDataStr =
-                        if hasStarData then
-                            let count = imgStats.StarCount |> Option.map string |> Option.defaultValue ""
-                            let fwhm = imgStats.MedianFWHM |> Option.map (sprintf "%.2f") |> Option.defaultValue ""
-                            sprintf ",%s,%s" count fwhm
-                        else ""
-                    sprintf "%s,%d,%d,%d,%d,%s%s%s,%s,%.0f,%.0f,%.2f,%.2f,%.2f,%.2f,%.2f"
-                        imgStats.FileName
-                        imgStats.Width
-                        imgStats.Height
-                        imgStats.Channels
-                        imgStats.FileSize
-                        imgStats.Compression
-                        metadataStr
-                        starDataStr
-                        channelName
-                        ch.Min
-                        ch.Max
-                        ch.Mean
-                        ch.Median
-                        ch.StdDev
-                        madVal
-                        snrVal
-                else
-                    sprintf "%s,%d,%d,%d,%s,%.0f,%.0f,%.2f,%.2f,%.2f"
-                        imgStats.FileName
-                        imgStats.Width
-                        imgStats.Height
-                        imgStats.Channels
-                        channelName
-                        ch.Min
-                        ch.Max
-                        ch.Mean
-                        ch.Median
-                        ch.StdDev
+        for imgStats in stats do
+            for ch in imgStats.ChannelStats do
+                let channelName =
+                    if imgStats.Channels = 1 then "Mono"
+                    elif imgStats.Channels = 3 then
+                        match ch.Channel with
+                        | 0 -> "Red"
+                        | 1 -> "Green"
+                        | 2 -> "Blue"
+                        | _ -> sprintf "Ch%d" ch.Channel
+                    else sprintf "Ch%d" ch.Channel
 
-            match ch.Histogram with
-            | Some hist ->
-                let histData = hist |> Array.map string |> String.concat ","
-                writer.WriteLine($"{basicStats},{histData}")
-            | None ->
-                writer.WriteLine(basicStats)
+                let basicStats =
+                    if hasAdvanced then
+                        let madVal = ch.MAD |> Option.defaultValue 0.0
+                        let snrVal = ch.SNR |> Option.defaultValue 0.0
+                        let metadataStr =
+                            if hasFitsMetadata then
+                                let obj = imgStats.Object |> Option.defaultValue ""
+                                let flt = imgStats.Filter |> Option.defaultValue ""
+                                let typ = imgStats.ImageType |> Option.defaultValue ""
+                                sprintf ",%s,%s,%s" obj flt typ
+                            else ""
+                        let starDataStr =
+                            if hasStarData then
+                                let count = imgStats.StarCount |> Option.map string |> Option.defaultValue ""
+                                let fwhm = imgStats.MedianFWHM |> Option.map (sprintf "%.2f") |> Option.defaultValue ""
+                                sprintf ",%s,%s" count fwhm
+                            else ""
+                        sprintf "%s,%d,%d,%d,%d,%s%s%s,%s,%.0f,%.0f,%.2f,%.2f,%.2f,%.2f,%.2f"
+                            imgStats.FileName
+                            imgStats.Width
+                            imgStats.Height
+                            imgStats.Channels
+                            imgStats.FileSize
+                            imgStats.Compression
+                            metadataStr
+                            starDataStr
+                            channelName
+                            ch.Min
+                            ch.Max
+                            ch.Mean
+                            ch.Median
+                            ch.StdDev
+                            madVal
+                            snrVal
+                    else
+                        sprintf "%s,%d,%d,%d,%s,%.0f,%.0f,%.2f,%.2f,%.2f"
+                            imgStats.FileName
+                            imgStats.Width
+                            imgStats.Height
+                            imgStats.Channels
+                            channelName
+                            ch.Min
+                            ch.Max
+                            ch.Mean
+                            ch.Median
+                            ch.StdDev
+
+                match ch.Histogram with
+                | Some hist ->
+                    let histData = hist |> Array.map string |> String.concat ","
+                    writer.WriteLine($"{basicStats},{histData}")
+                | None ->
+                    writer.WriteLine(basicStats)
 
 let run (args: string array) =
     let hasHelp = args |> Array.contains "--help" || args |> Array.contains "-h"
@@ -679,7 +999,7 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputPath, metricsLevel, detectStars, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) = parseArgs args
+                let (inputPattern, outputPath, metricsLevel, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) = parseArgs args
 
                 let inputDir = Path.GetDirectoryName(inputPattern)
                 let pattern = Path.GetFileName(inputPattern)
@@ -696,14 +1016,21 @@ let run (args: string array) =
                         return 1
                     else
                         let plural = if files.Length = 1 then "" else "s"
-                        printfn $"Found {files.Length} file{plural} to analyze"
+                        let mode = if headerOnly then "(header-only mode)" else ""
+                        printfn $"Found {files.Length} file{plural} to analyze {mode}"
 
                         let! results =
-                            files
-                            |> Array.map (fun f -> analyzeImage f metricsLevel detectStars)
-                            |> Async.Parallel
+                            if headerOnly then
+                                files
+                                |> Array.map analyzeImageMetadata
+                                |> Async.Parallel
+                            else
+                                files
+                                |> Array.map (fun f -> analyzeImage f metricsLevel detectStars)
+                                |> Async.Parallel
 
-                        let allStats = results |> Array.choose id
+                        let allStats = results |> Array.choose (fun r -> r.Stats)
+                        let failures = results |> Array.filter (fun r -> r.Error.IsSome)
 
                         if allStats.Length = 0 then
                             Log.Error("No images could be analyzed")
@@ -721,7 +1048,10 @@ let run (args: string array) =
                                     let filteredPlural = if filtered = 1 then "" else "s"
                                     printfn $"Filtered out {filtered} file{filteredPlural} based on quality thresholds"
 
-                                printStats filteredStats groupBy sortBy sortOrder
+                                if headerOnly then
+                                    printStatsHeaderOnly filteredStats groupBy sortBy sortOrder
+                                else
+                                    printStats filteredStats groupBy sortBy sortOrder
 
                                 match outputPath with
                                 | Some path ->
@@ -736,6 +1066,17 @@ let run (args: string array) =
                                 if filteredStats.Length < allStats.Length then
                                     let displayedPlural = if filteredStats.Length = 1 then "" else "s"
                                     printfn $"Displayed {filteredStats.Length} file{displayedPlural} after filtering"
+
+                                if failures.Length > 0 then
+                                    printfn ""
+                                    printfn "================================================================================"
+                                    let failPlural = if failures.Length = 1 then "" else "s"
+                                    printfn $"Failed to process {failures.Length} file{failPlural}:"
+                                    printfn "================================================================================"
+                                    for failure in failures do
+                                        let fileName = Path.GetFileName(failure.FilePath)
+                                        let error = failure.Error |> Option.defaultValue "Unknown error"
+                                        printfn $"  - {fileName}: {error}"
 
                                 return if allStats.Length = files.Length then 0 else 1
             with ex ->

@@ -1,9 +1,44 @@
 module Commands.Calibrate
 
+open System
+open System.IO
 open Serilog
+open XisfLib.Core
+
+// --- Defaults ---
+let private defaultPedestal = 0
+let private defaultSuffix = "_cal"
+let private defaultParallel = Environment.ProcessorCount
+// ---
+
+type CalibrationConfig = {
+    InputPattern: string
+    OutputDir: string
+    BiasFrame: string option
+    BiasLevel: float option
+    DarkFrame: string option
+    FlatFrame: string option
+    UncalibratedDark: bool
+    UncalibratedFlat: bool
+    OutputPedestal: int
+    Suffix: string
+    Overwrite: bool
+    DryRun: bool
+    MaxParallel: int
+}
+
+type MasterFrames = {
+    BiasData: float[] option
+    DarkData: float[] option
+    FlatData: float[] option
+    FlatMedian: float option
+    Width: int
+    Height: int
+    Channels: int
+}
 
 let showHelp() =
-    printfn "calibrate - Apply bias/dark/flat calibration frames"
+    printfn "calibrate - Apply calibration frames to light frames"
     printfn ""
     printfn "Usage: xisfprep calibrate [options]"
     printfn ""
@@ -11,17 +46,452 @@ let showHelp() =
     printfn "  --input, -i <pattern>     Input light frames (wildcards supported)"
     printfn "  --output, -o <directory>  Output directory for calibrated frames"
     printfn ""
-    printfn "Optional:"
+    printfn "Calibration Frames:"
     printfn "  --bias, -b <file>         Master bias frame"
+    printfn "  --bias-level <value>      Constant bias value (alternative to --bias)"
     printfn "  --dark, -d <file>         Master dark frame"
     printfn "  --flat, -f <file>         Master flat frame"
-    printfn "  --optimize-darks          Scale dark frame by exposure time"
-    printfn "  --pedestal <value>        Output pedestal value [0-65535] (default: 0)"
+    printfn ""
+    printfn "Master Frame State:"
+    printfn "  --uncalibrated-dark       Dark is raw (not bias-subtracted)"
+    printfn "  --uncalibrated-flat       Flat is raw (not bias/dark-subtracted)"
+    printfn "                            Default: masters are pre-calibrated"
+    printfn ""
+    printfn "Optional:"
+    printfn "  --pedestal <value>        Output pedestal [0-65535] (default: 0)"
     printfn "  --suffix <text>           Output filename suffix (default: _cal)"
+    printfn "  --overwrite               Overwrite existing output files"
+    printfn "  --dry-run                 Show what would be done without processing"
+    printfn "  --parallel <n>            Number of parallel operations (default: CPU cores)"
+    printfn ""
+    printfn "Algorithm:"
+    printfn "  Output = ((Light - Bias - Dark) / Flat) + Pedestal"
     printfn ""
     printfn "Examples:"
-    printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"calibrated/\" -b bias.xisf -d dark.xisf -f flat.xisf"
-    printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"calibrated/\" --pedestal 100"
+    printfn "  # Full calibration (standard workflow)"
+    printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"cal/\" -b bias.xisf -d dark.xisf -f flat.xisf"
+    printfn ""
+    printfn "  # Create master darks with constant bias"
+    printfn "  xisfprep calibrate -i \"darks/*.xisf\" -o \"darks_cal/\" --bias-level 500"
+    printfn ""
+    printfn "  # With output pedestal to prevent clipping"
+    printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"cal/\" -b bias.xisf -d dark.xisf -f flat.xisf --pedestal 100"
+    printfn ""
+    printfn "  # Pedestal only (shift histogram)"
+    printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"adjusted/\" --pedestal 100"
+
+let parseArgs (args: string array) =
+    let rec parse (args: string list) input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel =
+        match args with
+        | [] -> (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel)
+        | "--input" :: value :: rest | "-i" :: value :: rest ->
+            parse rest (Some value) output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--output" :: value :: rest | "-o" :: value :: rest ->
+            parse rest input (Some value) bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--bias" :: value :: rest | "-b" :: value :: rest ->
+            parse rest input output (Some value) biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--bias-level" :: value :: rest ->
+            parse rest input output bias (Some (float value)) dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--dark" :: value :: rest | "-d" :: value :: rest ->
+            parse rest input output bias biasLevel (Some value) flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--flat" :: value :: rest | "-f" :: value :: rest ->
+            parse rest input output bias biasLevel dark (Some value) uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--uncalibrated-dark" :: rest ->
+            parse rest input output bias biasLevel dark flat true uncalFlat pedestal suffix overwrite dryRun maxParallel
+        | "--uncalibrated-flat" :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark true pedestal suffix overwrite dryRun maxParallel
+        | "--pedestal" :: value :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat (Some (int value)) suffix overwrite dryRun maxParallel
+        | "--suffix" :: value :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal (Some value) overwrite dryRun maxParallel
+        | "--overwrite" :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix true dryRun maxParallel
+        | "--dry-run" :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite true maxParallel
+        | "--parallel" :: value :: rest ->
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun (Some (int value))
+        | arg :: rest ->
+            failwithf "Unknown argument: %s" arg
+
+    let (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel) =
+        parse (List.ofArray args) None None None None None None false false None None false false None
+
+    // Validation
+    let input = match input with Some v -> v | None -> failwith "Required argument: --input"
+    let output = match output with Some v -> v | None -> failwith "Required argument: --output"
+
+    if bias.IsSome && biasLevel.IsSome then
+        failwith "--bias and --bias-level are mutually exclusive"
+
+    if bias.IsNone && biasLevel.IsNone && dark.IsNone && flat.IsNone && pedestal.IsNone then
+        failwith "At least one of --bias, --bias-level, --dark, --flat, or --pedestal required"
+
+    if uncalDark && bias.IsNone && biasLevel.IsNone then
+        failwith "--uncalibrated-dark requires --bias or --bias-level"
+
+    if uncalFlat && bias.IsNone && biasLevel.IsNone then
+        failwith "--uncalibrated-flat requires --bias or --bias-level"
+
+    if uncalFlat && dark.IsNone then
+        failwith "--uncalibrated-flat requires --dark"
+
+    let pedestal = pedestal |> Option.defaultValue defaultPedestal
+    if pedestal < 0 || pedestal > 65535 then
+        failwith "Pedestal must be in range [0, 65535]"
+
+    let suffix = suffix |> Option.defaultValue defaultSuffix
+    let maxParallel = maxParallel |> Option.defaultValue defaultParallel
+
+    {
+        InputPattern = input
+        OutputDir = output
+        BiasFrame = bias
+        BiasLevel = biasLevel
+        DarkFrame = dark
+        FlatFrame = flat
+        UncalibratedDark = uncalDark
+        UncalibratedFlat = uncalFlat
+        OutputPedestal = pedestal
+        Suffix = suffix
+        Overwrite = overwrite
+        DryRun = dryRun
+        MaxParallel = maxParallel
+    }
+
+let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
+    async {
+        let reader = new XisfReader()
+        let! metadata = reader.ReadAsync(path) |> Async.AwaitTask
+
+        if metadata.Images.Count = 0 then
+            failwithf "No images found in file: %s" path
+
+        let img = metadata.Images.[0]
+        let width = int img.Geometry.Width
+        let height = int img.Geometry.Height
+        let channels = int img.Geometry.ChannelCount
+
+        let pixelData =
+            if img.PixelData :? InlineDataBlock then
+                (img.PixelData :?> InlineDataBlock).Data.ToArray()
+            else
+                failwithf "Expected inline data in %s" path
+
+        let pixelCount = width * height * channels
+        let floatData = Array.zeroCreate pixelCount
+
+        // Convert UInt16 to float
+        for i = 0 to pixelCount - 1 do
+            let offset = i * 2
+            let value = uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8)
+            floatData.[i] <- float value
+
+        return (floatData, width, height, channels)
+    }
+
+let calculateMedian (data: float[]) : float =
+    if Array.isEmpty data then 0.0
+    else
+        let sorted = Array.copy data
+        Array.sortInPlace sorted
+        let mid = sorted.Length / 2
+        if sorted.Length % 2 = 0 then
+            (sorted.[mid - 1] + sorted.[mid]) / 2.0
+        else
+            sorted.[mid]
+
+let loadMasterFrames (config: CalibrationConfig) : Async<MasterFrames> =
+    async {
+        let mutable width = 0
+        let mutable height = 0
+        let mutable channels = 0
+        let mutable biasData = None
+        let mutable darkData = None
+        let mutable flatData = None
+        let mutable flatMedian = None
+
+        // Load bias frame or create constant bias
+        match config.BiasFrame, config.BiasLevel with
+        | Some path, _ ->
+            Log.Information("Loading master bias: {Path}", path)
+            let! (data, w, h, c) = loadFrameAsFloat path
+            width <- w
+            height <- h
+            channels <- c
+            biasData <- Some data
+        | None, Some level ->
+            Log.Information("Using constant bias level: {Level}", level)
+            biasData <- None // Will be applied as constant during calibration
+        | None, None ->
+            () // No bias
+
+        // Load dark frame
+        match config.DarkFrame with
+        | Some path ->
+            Log.Information("Loading master dark: {Path}", path)
+            let! (data, w, h, c) = loadFrameAsFloat path
+            if width > 0 && (w <> width || h <> height || c <> channels) then
+                failwithf "Dark dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
+            width <- w
+            height <- h
+            channels <- c
+            darkData <- Some data
+        | None ->
+            ()
+
+        // Load flat frame
+        match config.FlatFrame with
+        | Some path ->
+            Log.Information("Loading master flat: {Path}", path)
+            let! (data, w, h, c) = loadFrameAsFloat path
+            if width > 0 && (w <> width || h <> height || c <> channels) then
+                failwithf "Flat dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
+            width <- w
+            height <- h
+            channels <- c
+
+            // Calculate median for normalization
+            let median = calculateMedian data
+            Log.Information("Flat median: {Median:F2}", median)
+            flatData <- Some data
+            flatMedian <- Some median
+        | None ->
+            ()
+
+        return {
+            BiasData = biasData
+            DarkData = darkData
+            FlatData = flatData
+            FlatMedian = flatMedian
+            Width = width
+            Height = height
+            Channels = channels
+        }
+    }
+
+let calibratePixel (lightValue: float) (biasValue: float) (darkValue: float option)
+                   (flatValue: float option) (flatMedian: float option) (pedestal: int) : uint16 =
+    let afterBias = lightValue - biasValue
+
+    let afterDark =
+        match darkValue with
+        | Some d -> afterBias - d
+        | None -> afterBias
+
+    let afterFlat =
+        match flatValue, flatMedian with
+        | Some f, Some m when f > 0.0 -> afterDark * (m / f)
+        | _ -> afterDark
+
+    let final = afterFlat + float pedestal
+    uint16 (max 0.0 (min 65535.0 final))
+
+let buildCalibrationHistory (config: CalibrationConfig) =
+    [
+        yield "Calibrated with xisfprep calibrate"
+
+        match config.BiasFrame with
+        | Some path -> yield sprintf "Master bias: %s" (Path.GetFileName(path))
+        | None -> ()
+
+        match config.BiasLevel with
+        | Some level -> yield sprintf "Bias level: %.0f" level
+        | None -> ()
+
+        match config.DarkFrame with
+        | Some path ->
+            yield sprintf "Master dark: %s" (Path.GetFileName(path))
+            if config.UncalibratedDark then
+                yield "Dark: uncalibrated (raw)"
+            else
+                yield "Dark: calibrated (bias-subtracted)"
+        | None -> ()
+
+        match config.FlatFrame with
+        | Some path ->
+            yield sprintf "Master flat: %s" (Path.GetFileName(path))
+            if config.UncalibratedFlat then
+                yield "Flat: uncalibrated (raw)"
+            else
+                yield "Flat: calibrated (bias/dark-subtracted)"
+        | None -> ()
+
+        if config.OutputPedestal <> 0 then
+            yield sprintf "Output pedestal: %d" config.OutputPedestal
+    ]
+
+let buildCalibrationProperties (config: CalibrationConfig) =
+    [
+        match config.BiasFrame with
+        | Some path -> yield XisfStringProperty("Calibration:BiasFrame", path) :> XisfProperty
+        | None -> ()
+
+        match config.BiasLevel with
+        | Some level -> yield XisfScalarProperty<float>("Calibration:BiasLevel", level) :> XisfProperty
+        | None -> ()
+
+        match config.DarkFrame with
+        | Some path ->
+            yield XisfStringProperty("Calibration:DarkFrame", path) :> XisfProperty
+            yield XisfScalarProperty<bool>("Calibration:DarkCalibrated", not config.UncalibratedDark) :> XisfProperty
+        | None -> ()
+
+        match config.FlatFrame with
+        | Some path ->
+            yield XisfStringProperty("Calibration:FlatFrame", path) :> XisfProperty
+            yield XisfScalarProperty<bool>("Calibration:FlatCalibrated", not config.UncalibratedFlat) :> XisfProperty
+        | None -> ()
+
+        if config.OutputPedestal <> 0 then
+            yield XisfScalarProperty<int>("Calibration:OutputPedestal", config.OutputPedestal) :> XisfProperty
+    ]
+
+let getBiasValue (masters: MasterFrames) (config: CalibrationConfig) (index: int) =
+    match masters.BiasData, config.BiasLevel with
+    | Some data, _ -> data.[index]
+    | None, Some level -> level
+    | None, None -> 0.0
+
+let processPixels (lightPixelData: byte[]) (masters: MasterFrames) (config: CalibrationConfig) (pixelCount: int) =
+    let calibratedData = Array.zeroCreate (pixelCount * 2)
+    let mutable zeroCount = 0
+    let mutable flatZeroCount = 0
+
+    for i = 0 to pixelCount - 1 do
+        let offset = i * 2
+        let lightValue = float (uint16 lightPixelData.[offset] ||| (uint16 lightPixelData.[offset + 1] <<< 8))
+        let biasValue = getBiasValue masters config i
+        let darkValue = masters.DarkData |> Option.map (fun data -> data.[i])
+        let flatValue = masters.FlatData |> Option.map (fun data -> data.[i])
+
+        if flatValue.IsSome && flatValue.Value = 0.0 then
+            flatZeroCount <- flatZeroCount + 1
+
+        let calibrated = calibratePixel lightValue biasValue darkValue flatValue masters.FlatMedian config.OutputPedestal
+
+        if calibrated = 0us then
+            zeroCount <- zeroCount + 1
+
+        calibratedData.[offset] <- byte (calibrated &&& 0xFFus)
+        calibratedData.[offset + 1] <- byte ((calibrated >>> 8) &&& 0xFFus)
+
+    (calibratedData, zeroCount, flatZeroCount)
+
+let logClippingWarnings (zeroCount: int) (flatZeroCount: int) (pixelCount: int) =
+    let totalPixels = float pixelCount
+
+    if flatZeroCount > 0 then
+        let pct = (float flatZeroCount / totalPixels) * 100.0
+        if pct > 0.1 then
+            Log.Warning("Flat has {Count} zero pixels ({Pct:F2}%) - division skipped for these pixels", flatZeroCount, pct)
+
+    if zeroCount > 0 then
+        let pct = (float zeroCount / totalPixels) * 100.0
+        if pct > 1.0 then
+            Log.Warning("Output has {Count} zero pixels ({Pct:F2}%) - consider increasing --pedestal", zeroCount, pct)
+
+let createCalibratedImage (lightImg: XisfImage) (calibratedData: byte[]) (config: CalibrationConfig) =
+    let dataBlock = InlineDataBlock(ReadOnlyMemory(calibratedData), XisfEncoding.Base64)
+
+    let historyEntries = buildCalibrationHistory config
+    let historyFits = historyEntries |> List.map (fun text -> XisfFitsKeyword("HISTORY", "", text) :> XisfCoreElement)
+
+    let existingElements =
+        if isNull lightImg.AssociatedElements then [||]
+        else lightImg.AssociatedElements |> Seq.toArray
+
+    let allElements = Array.append existingElements (Array.ofList historyFits)
+
+    let calibrationProps = buildCalibrationProperties config
+    let existingProps =
+        if isNull lightImg.Properties then [||]
+        else lightImg.Properties |> Seq.toArray
+
+    let allProps = Array.append existingProps (Array.ofList calibrationProps)
+
+    XisfImage(
+        lightImg.Geometry,
+        lightImg.SampleFormat,
+        lightImg.ColorSpace,
+        dataBlock,
+        lightImg.Bounds,
+        lightImg.PixelStorage,
+        lightImg.ImageType,
+        lightImg.Offset,
+        lightImg.Orientation,
+        lightImg.ImageId,
+        lightImg.Uuid,
+        allProps,
+        allElements
+    )
+
+let calibrateImage (lightPath: string) (masters: MasterFrames) (config: CalibrationConfig) : Async<XisfImage> =
+    async {
+        let reader = new XisfReader()
+        let! lightUnit = reader.ReadAsync(lightPath) |> Async.AwaitTask
+
+        if lightUnit.Images.Count = 0 then
+            failwithf "No images in light frame: %s" lightPath
+
+        let lightImg = lightUnit.Images.[0]
+        let width = int lightImg.Geometry.Width
+        let height = int lightImg.Geometry.Height
+        let channels = int lightImg.Geometry.ChannelCount
+
+        // Validate dimensions
+        if masters.Width > 0 && (width <> masters.Width || height <> masters.Height || channels <> masters.Channels) then
+            failwithf "Light frame dimension mismatch: Expected %dx%dx%d, got %dx%dx%d in %s"
+                masters.Width masters.Height masters.Channels width height channels lightPath
+
+        // Get light pixel data
+        let lightPixelData =
+            if lightImg.PixelData :? InlineDataBlock then
+                (lightImg.PixelData :?> InlineDataBlock).Data.ToArray()
+            else
+                failwithf "Expected inline data in %s" lightPath
+
+        let pixelCount = width * height * channels
+        let (calibratedData, zeroCount, flatZeroCount) = processPixels lightPixelData masters config pixelCount
+
+        logClippingWarnings zeroCount flatZeroCount pixelCount
+
+        return createCalibratedImage lightImg calibratedData config
+    }
+
+let processFile (filePath: string) (masters: MasterFrames) (config: CalibrationConfig) : Async<Result<string, string>> =
+    async {
+        try
+            let fileName = Path.GetFileNameWithoutExtension(filePath)
+            let ext = Path.GetExtension(filePath)
+            let outputFileName = fileName + config.Suffix + ext
+            let outputPath = Path.Combine(config.OutputDir, outputFileName)
+
+            if not config.Overwrite && File.Exists(outputPath) then
+                Log.Warning("Output file exists, skipping (use --overwrite to replace): {Path}", outputPath)
+                return Ok filePath
+            else
+                if config.DryRun then
+                    if config.Overwrite && File.Exists(outputPath) then
+                        Log.Information("[DRY RUN] Would overwrite: {Path}", outputPath)
+                    else
+                        Log.Information("[DRY RUN] Would create: {Path}", outputPath)
+                    return Ok filePath
+                else
+                    Log.Information("Calibrating: {File}", Path.GetFileName(filePath))
+
+                    let! calibratedImage = calibrateImage filePath masters config
+
+                    let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Calibrate v1.0")
+                    let outUnit = XisfFactory.CreateMonolithic(metadata, calibratedImage)
+
+                    let writer = new XisfWriter()
+                    do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask
+
+                    return Ok filePath
+        with ex ->
+            Log.Error("Failed to process {File}: {Error}", Path.GetFileName(filePath), ex.Message)
+            return Error ex.Message
+    }
 
 let run (args: string array) =
     let hasHelp = args |> Array.contains "--help" || args |> Array.contains "-h"
@@ -30,10 +500,61 @@ let run (args: string array) =
         showHelp()
         0
     else
-        Log.Error("calibrate command is not yet implemented")
-        printfn ""
-        printfn "Arguments received:"
-        args |> Array.iter (fun arg -> printfn "  %s" arg)
-        printfn ""
-        printfn "Run 'xisfprep calibrate --help' for usage information"
-        1
+        let computation = async {
+            try
+                let config = parseArgs args
+
+                let inputDir = Path.GetDirectoryName(config.InputPattern)
+                let pattern = Path.GetFileName(config.InputPattern)
+                let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
+
+                if not (Directory.Exists(actualDir)) then
+                    Log.Error("Input directory not found: {Dir}", actualDir)
+                    return 1
+                else
+                    let files = Directory.GetFiles(actualDir, pattern) |> Array.sort
+
+                    if files.Length = 0 then
+                        Log.Error("No files found matching pattern: {Pattern}", config.InputPattern)
+                        return 1
+                    else
+                        let plural = if files.Length = 1 then "" else "s"
+                        let mode = if config.DryRun then " [DRY RUN]" else ""
+                        printfn "Found %d file%s to calibrate%s" files.Length plural mode
+
+                        // Load master frames
+                        let! masters = loadMasterFrames config
+
+                        // Create output directory
+                        if not config.DryRun && not (Directory.Exists(config.OutputDir)) then
+                            Directory.CreateDirectory(config.OutputDir) |> ignore
+                            Log.Information("Created output directory: {Dir}", config.OutputDir)
+
+                        // Process files in parallel
+                        let! results =
+                            files
+                            |> Array.map (fun file -> processFile file masters config)
+                            |> Async.Parallel
+
+                        let successes = results |> Array.filter (function Ok _ -> true | Error _ -> false)
+                        let failures = results |> Array.filter (function Error _ -> true | Ok _ -> false)
+
+                        printfn ""
+                        if config.DryRun then
+                            printfn "Dry run complete - no files were modified"
+                        else
+                            printfn "Successfully calibrated %d of %d file%s" successes.Length files.Length plural
+
+                        if failures.Length > 0 then
+                            printfn "Failed to process %d file%s" failures.Length (if failures.Length = 1 then "" else "s")
+                            return 1
+                        else
+                            return 0
+            with ex ->
+                Log.Error("Error: {Message}", ex.Message)
+                printfn ""
+                printfn "Run 'xisfprep calibrate --help' for usage information"
+                return 1
+        }
+
+        Async.RunSynchronously computation
