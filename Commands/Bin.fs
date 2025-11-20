@@ -41,6 +41,8 @@ let showHelp() =
     printfn $"  --suffix <text>           Output filename suffix (default: {defaultSuffix defaultFactor} where N is factor)"
     printfn "  --overwrite               Overwrite existing output files (default: skip existing)"
     printfn $"  --parallel <n>            Number of parallel operations (default: {defaultParallel} CPU cores)"
+    printfn "  --output-format <format>  Output sample format (default: preserve input format)"
+    printfn "                              uint8, uint16, uint32, float32, float64"
     printfn ""
     printfn "Use Cases:"
     printfn "  - Quick preview of large images"
@@ -53,32 +55,36 @@ let showHelp() =
     printfn "  xisfprep bin -i \"lights/*.xisf\" -o \"preview/\" --factor 4 --method median"
 
 let parseArgs (args: string array) =
-    let rec parse (args: string list) input output factor method suffix overwrite maxParallel =
+    let rec parse (args: string list) input output factor method suffix overwrite maxParallel outputFormat =
         match args with
-        | [] -> (input, output, factor, method, suffix, overwrite, maxParallel)
+        | [] -> (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat)
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output factor method suffix overwrite maxParallel
+            parse rest (Some value) output factor method suffix overwrite maxParallel outputFormat
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) factor method suffix overwrite maxParallel
+            parse rest input (Some value) factor method suffix overwrite maxParallel outputFormat
         | "--factor" :: value :: rest ->
-            parse rest input output (Some (int value)) method suffix overwrite maxParallel
+            parse rest input output (Some (int value)) method suffix overwrite maxParallel outputFormat
         | "--method" :: value :: rest ->
             let m = match value.ToLower() with
                     | "average" -> Average
                     | "median" -> Median
                     | "sum" -> Sum
                     | _ -> failwithf "Unknown binning method: %s" value
-            parse rest input output factor (Some m) suffix overwrite maxParallel
+            parse rest input output factor (Some m) suffix overwrite maxParallel outputFormat
         | "--suffix" :: value :: rest ->
-            parse rest input output factor method (Some value) overwrite maxParallel
+            parse rest input output factor method (Some value) overwrite maxParallel outputFormat
         | "--overwrite" :: rest ->
-            parse rest input output factor method suffix true maxParallel
+            parse rest input output factor method suffix true maxParallel outputFormat
         | "--parallel" :: value :: rest ->
-            parse rest input output factor method suffix overwrite (Some (int value))
+            parse rest input output factor method suffix overwrite (Some (int value)) outputFormat
+        | "--output-format" :: value :: rest ->
+            match PixelIO.parseOutputFormat value with
+            | Some fmt -> parse rest input output factor method suffix overwrite maxParallel (Some fmt)
+            | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
         | arg :: rest ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, factor, method, suffix, overwrite, maxParallel) = parse (List.ofArray args) None None None None None false None
+    let (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat) = parse (List.ofArray args) None None None None None false None None
 
     let input = match input with Some v -> v | None -> failwith "Required argument: --input"
     let output = match output with Some v -> v | None -> failwith "Required argument: --output"
@@ -93,42 +99,36 @@ let parseArgs (args: string array) =
     if maxParallel < 1 then
         failwith "Parallel count must be at least 1"
 
-    (input, output, factor, method, suffix, overwrite, maxParallel)
+    (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat)
 
-let getPixelData (img: XisfImage) =
-    let data = img.PixelData
-    if data :? InlineDataBlock then
-        (data :?> InlineDataBlock).Data.ToArray()
-    else
-        failwith "Expected inline data"
-
-let applyBinningMethod (pixels: uint16 array) (method: BinningMethod) =
-    if Array.isEmpty pixels then 0us
+let applyBinningMethod (pixels: float array) (method: BinningMethod) =
+    if Array.isEmpty pixels then 0.0
     else
         match method with
         | Average ->
-            let sum = pixels |> Array.sumBy uint32
-            uint16 (sum / uint32 pixels.Length)
+            Array.average pixels
         | Median ->
             let sorted = pixels |> Array.sort
             let mid = sorted.Length / 2
             if sorted.Length % 2 = 0 then
-                (uint32 sorted.[mid - 1] + uint32 sorted.[mid]) / 2u |> uint16
+                (sorted.[mid - 1] + sorted.[mid]) / 2.0
             else
                 sorted.[mid]
         | Sum ->
-            pixels |> Array.sumBy uint32 |> min 65535u |> uint16
+            Array.sum pixels |> min 65535.0
 
-let createBinnedData (pixelData: byte[]) width height channels factor (method: BinningMethod) =
-    let bytesPerPixel = channels * 2
+let createBinnedData (img: XisfImage) width height channels factor (method: BinningMethod) (outputFormat: XisfSampleFormat) (normalize: bool) =
+    // Read pixels as float using PixelIO (handles all sample formats)
+    let pixelFloats = PixelIO.readPixelsAsFloat img
+
     let newWidth = width / factor
     let newHeight = height / factor
 
     let getPixel x y channel =
-        let offset = (y * width + x) * bytesPerPixel + channel * 2
-        uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8)
+        let offset = (y * width + x) * channels + channel
+        pixelFloats.[offset]
 
-    let binnedData = Array.zeroCreate (newWidth * newHeight * bytesPerPixel)
+    let binnedFloats = Array.zeroCreate (newWidth * newHeight * channels)
 
     // Pre-allocate one array for the binning block and reuse it
     let blockPixels = Array.zeroCreate (factor * factor)
@@ -146,22 +146,21 @@ let createBinnedData (pixelData: byte[]) width height channels factor (method: B
                             pixelCount <- pixelCount + 1
 
                 let binnedValue =
-                    if pixelCount = 0 then 0us
+                    if pixelCount = 0 then 0.0
                     else
-                        // Pass a slice of the array that contains valid pixels
                         applyBinningMethod blockPixels.[0 .. pixelCount - 1] method
 
-                let offset = (newY * newWidth + newX) * bytesPerPixel + ch * 2
-                binnedData.[offset] <- byte binnedValue
-                binnedData.[offset + 1] <- byte (binnedValue >>> 8)
+                let offset = (newY * newWidth + newX) * channels + ch
+                binnedFloats.[offset] <- binnedValue
 
-    binnedData
+    // Write output in requested format (preserves input format by default)
+    PixelIO.writePixelsFromFloat binnedFloats outputFormat normalize
 
 let validateDimensions width height factor =
     if width % factor <> 0 || height % factor <> 0 then
         Log.Warning($"Image dimensions ({width}x{height}) not divisible by factor {factor} - will truncate")
 
-let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight channels factor (method: BinningMethod) =
+let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight channels factor (method: BinningMethod) (outputFormat: XisfSampleFormat) =
     let newGeometry = XisfImageGeometry([| uint32 newWidth; uint32 newHeight |], uint32 channels)
     let dataBlock = InlineDataBlock(ReadOnlyMemory(binnedData), XisfEncoding.Base64)
 
@@ -173,12 +172,18 @@ let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight c
             let existingFits = img.AssociatedElements :> seq<_> |> Seq.toArray
             Array.append existingFits [| XisfFitsKeyword("HISTORY", "", historyEntry) :> XisfCoreElement |]
 
+    // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
+    let bounds =
+        match PixelIO.getBoundsForFormat outputFormat with
+        | Some b -> b
+        | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+
     XisfImage(
         newGeometry,
-        img.SampleFormat,
+        outputFormat,
         img.ColorSpace,
         dataBlock,
-        img.Bounds,
+        bounds,
         img.PixelStorage,
         img.ImageType,
         img.Offset,
@@ -189,7 +194,7 @@ let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight c
         updatedFits
     )
 
-let binImage (inputPath: string) (outputDir: string) (factor: int) (method: BinningMethod) (suffix: string) (overwrite: bool) : Async<bool> =
+let binImage (inputPath: string) (outputDir: string) (factor: int) (method: BinningMethod) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) : Async<bool> =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -218,10 +223,15 @@ let binImage (inputPath: string) (outputDir: string) (factor: int) (method: Binn
             let newWidth = width / factor
             let newHeight = height / factor
 
-            let pixelData = getPixelData img
-            let binnedData = createBinnedData pixelData width height channels factor method
+            // Determine output format (use override or preserve input format)
+            let (outputFormat, normalize) =
+                match outputFormatOverride with
+                | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
+                | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
 
-            let binnedImage = createOutputImage img binnedData newWidth newHeight channels factor method
+            let binnedData = createBinnedData img width height channels factor method outputFormat normalize
+
+            let binnedImage = createOutputImage img binnedData newWidth newHeight channels factor method outputFormat
 
             let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Bin v1.0")
             let outUnit = XisfFactory.CreateMonolithic(metadata, binnedImage)
@@ -247,7 +257,7 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputDir, factor, method, suffix, overwrite, maxParallel) = parseArgs args
+                let (inputPattern, outputDir, factor, method, suffix, overwrite, maxParallel, outputFormat) = parseArgs args
 
                 Log.Information($"Binning images with factor {factor} using {method} method")
 
@@ -273,7 +283,7 @@ let run (args: string array) =
                         printfn ""
 
                         // Process all files in parallel with max parallelism limit
-                        let tasks = files |> Array.map (fun f -> binImage f outputDir factor method suffix overwrite)
+                        let tasks = files |> Array.map (fun f -> binImage f outputDir factor method suffix overwrite outputFormat)
                         let! results = Async.Parallel(tasks, maxDegreeOfParallelism = maxParallel)
 
                         let successCount = results |> Array.filter id |> Array.length

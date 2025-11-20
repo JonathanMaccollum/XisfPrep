@@ -81,6 +81,8 @@ let showHelp() =
     printfn "  --high-count <n>          Drop N highest pixels (for minmax, default: 1)"
     printfn $"  --iterations <n>          Rejection iterations (default: {defaultIterations})"
     printfn "  --overwrite               Overwrite existing output file (default: skip with warning)"
+    printfn "  --output-format <format>  Output sample format (default: float32 for stacking precision)"
+    printfn "                              uint8, uint16, uint32, float32, float64"
     printfn ""
     printfn "Process:"
     printfn "  1. Load all input images into memory"
@@ -94,7 +96,7 @@ let showHelp() =
     printfn "Validation:"
     printfn "  - All images must have same dimensions"
     printfn "  - All images must have same channel count"
-    printfn "  - All images must have same sample format (UInt16)"
+    printfn "  - All images must have same sample format"
     printfn "  - Minimum 3 images required for rejection algorithms"
     printfn ""
     printfn "Examples:"
@@ -115,6 +117,7 @@ type private ParseState = {
     HighCount: int option
     Iterations: int option
     Overwrite: bool
+    OutputFormat: XisfSampleFormat option
 }
 
 let parseArgs (args: string array) =
@@ -131,6 +134,7 @@ let parseArgs (args: string array) =
         HighCount = None
         Iterations = None
         Overwrite = false
+        OutputFormat = None
     }
 
     let rec parse (state: ParseState) (args: string list) =
@@ -173,8 +177,8 @@ let parseArgs (args: string array) =
                 Iterations = iterations
             }
 
-            // Return the 4-tuple that the 'run' function expects
-            (input, output, settings, state.Overwrite)
+            // Return the 5-tuple that the 'run' function expects
+            (input, output, settings, state.Overwrite, state.OutputFormat)
 
         // Recursive calls are now clean and unambiguous
         | "--input" :: value :: rest | "-i" :: value :: rest ->
@@ -223,6 +227,10 @@ let parseArgs (args: string array) =
             parse { state with Iterations = Some (int value) } rest
         | "--overwrite" :: rest ->
             parse { state with Overwrite = true } rest
+        | "--output-format" :: value :: rest ->
+            match PixelIO.parseOutputFormat value with
+            | Some fmt -> parse { state with OutputFormat = Some fmt } rest
+            | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
         | arg :: rest ->
             failwithf "Unknown argument: %s" arg
 
@@ -317,13 +325,6 @@ module LinearFit =
 
 // --- Main Integration Logic ---
 
-let getPixelData (img: XisfImage) =
-    let data = img.PixelData
-    if data :? InlineDataBlock then
-        (data :?> InlineDataBlock).Data.ToArray()
-    else
-        failwith "Expected inline data"
-
 let validateImages (images: XisfImage[]) =
     let first = images.[0]
     let width = first.Geometry.Width
@@ -340,14 +341,13 @@ let validateImages (images: XisfImage[]) =
             failwithf "Image %d has different sample format: %A (expected %A)" i img.SampleFormat sampleFormat
     )
 
-let calculateImageStats (pixelArrays: byte[][]) (channels: int) (pixelCount: int) (bytesPerPixel: int) =
+let calculateImageStats (pixelArrays: float[][]) (channels: int) (pixelCount: int) =
     printfn "Calculating per-channel image statistics for normalization..."
 
-    let getImgStats (pixelData: byte[]) =
+    let getImgStats (pixelData: float[]) =
         Array.init channels (fun ch ->
             let values = Array.init pixelCount (fun pix ->
-                let offset = (pix * bytesPerPixel) + (ch * 2)
-                float (uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8))
+                pixelData.[pix * channels + ch]
             )
             let (mean, median, _) = Stats.calculate values
             (mean, median)
@@ -360,10 +360,9 @@ let calculateImageStats (pixelArrays: byte[][]) (channels: int) (pixelCount: int
     (map, refStats)
 
 let processPixel
-    (pixelArrays: byte[][])
+    (pixelArrays: float[][])
     (pix: int)
     (channels: int)
-    (bytesPerPixel: int)
     (combination: CombinationMethod)
     (normalization: NormalizationMethod)
     (rejection: RejectionMethod)
@@ -371,19 +370,17 @@ let processPixel
     (iterations: int)
     (imageStats: Map<int, (float * float)[]>)
     (referenceStats: (float * float)[])
-    : byte[] =
-
-    let baseOffset = pix * bytesPerPixel
+    : float[] =
 
     Array.init channels (fun channel ->
-        let channelOffset = baseOffset + (channel * 2)
+        let pixelIndex = pix * channels + channel
         let (refMean, refMedian) = referenceStats.[channel]
 
         // Get normalized pixel stack
         let rawPixelValues =
             pixelArrays
             |> Array.mapi (fun i arr ->
-                let rawValue = float (uint16 arr.[channelOffset] ||| (uint16 arr.[channelOffset + 1] <<< 8))
+                let rawValue = arr.[pixelIndex]
 
                 match normalization with
                 | NoNormalization -> rawValue
@@ -458,26 +455,21 @@ let processPixel
                 |> Array.map snd
 
         // Combine pixels
-        let combinedValue =
-            if Array.isEmpty pixelsToAverage then 0.0
-            else
-                match combination with
-                | Average ->
-                    let sum = Array.sum pixelsToAverage
-                    sum / (float pixelsToAverage.Length)
-                | Median ->
-                    let sorted = Array.copy pixelsToAverage
-                    Array.sortInPlace sorted
-                    let mid = sorted.Length / 2
-                    if sorted.Length % 2 = 0 then
-                        (sorted.[mid - 1] + sorted.[mid]) / 2.0
-                    else
-                        sorted.[mid]
-
-        let finalValue = uint16 (max 0.0 (min 65535.0 (round combinedValue)))
-        (byte finalValue, byte (finalValue >>> 8))
+        if Array.isEmpty pixelsToAverage then 0.0
+        else
+            match combination with
+            | Average ->
+                let sum = Array.sum pixelsToAverage
+                sum / (float pixelsToAverage.Length)
+            | Median ->
+                let sorted = Array.copy pixelsToAverage
+                Array.sortInPlace sorted
+                let mid = sorted.Length / 2
+                if sorted.Length % 2 = 0 then
+                    (sorted.[mid - 1] + sorted.[mid]) / 2.0
+                else
+                    sorted.[mid]
     )
-    |> Array.collect (fun (b1, b2) -> [| b1; b2 |])
 
 let run (args: string array) =
     let hasHelp = args |> Array.contains "--help" || args |> Array.contains "-h"
@@ -488,7 +480,7 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputPath, settings, overwrite) = parseArgs args
+                let (inputPattern, outputPath, settings, overwrite, outputFormatOverride) = parseArgs args
 
                 // Check if output exists
                 if File.Exists(outputPath) && not overwrite then
@@ -547,22 +539,22 @@ let run (args: string array) =
                 let height = int firstImg.Geometry.Height
                 let channels = int firstImg.Geometry.ChannelCount
                 let pixelCount = width * height
-                let bytesPerPixel = channels * 2
+                let inputFormat = firstImg.SampleFormat
 
-                printfn $"Image format: {width}x{height}, {channels} channel(s)"
+                printfn $"Image format: {width}x{height}, {channels} channel(s), {inputFormat}"
                 printfn $"Normalization: {settings.Normalization}"
                 printfn $"Rejection: {settings.Rejection}"
                 printfn $"Combination: {settings.Combination}"
 
-                // Get pixel data
-                let pixelArrays = images |> Array.map getPixelData
+                // Get pixel data using PixelIO (handles all sample formats)
+                let pixelArrays = images |> Array.map PixelIO.readPixelsAsFloat
 
                 // Calculate stats if normalization needed
                 let (imageStats, referenceStats) =
                     if settings.Normalization = NoNormalization then
                         (Map.empty, Array.create channels (0.0, 0.0))
                     else
-                        calculateImageStats pixelArrays channels pixelCount bytesPerPixel
+                        calculateImageStats pixelArrays channels pixelCount
 
                 printfn $"Processing {pixelCount} pixels in parallel..."
 
@@ -580,15 +572,37 @@ let run (args: string array) =
                 let pixelResults =
                     Array.Parallel.init pixelCount (fun pix ->
                         if pix % 500000 = 0 then reportProgress ()
-                        processPixel pixelArrays pix channels bytesPerPixel settings.Combination settings.Normalization settings.Rejection settings.RejectionNormalization settings.Iterations imageStats referenceStats
+                        processPixel pixelArrays pix channels settings.Combination settings.Normalization settings.Rejection settings.RejectionNormalization settings.Iterations imageStats referenceStats
                     )
 
-                // Flatten results
-                let stacked = Array.zeroCreate (pixelCount * bytesPerPixel)
+                // Flatten results into float array
+                let stackedFloats = Array.zeroCreate (pixelCount * channels)
                 for pix = 0 to pixelCount - 1 do
-                    let offset = pix * bytesPerPixel
-                    let channelBytes = pixelResults.[pix]
-                    Array.blit channelBytes 0 stacked offset bytesPerPixel
+                    let offset = pix * channels
+                    let channelValues = pixelResults.[pix]
+                    Array.blit channelValues 0 stackedFloats offset channels
+
+                // Determine output format
+                // Default: UInt16 → Float32 (preserves fractional precision from averaging)
+                // Float32/Float64 → preserve
+                let (outputFormat, normalize) =
+                    match outputFormatOverride with
+                    | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
+                    | None ->
+                        match inputFormat with
+                        | XisfSampleFormat.UInt8 | XisfSampleFormat.UInt16 | XisfSampleFormat.UInt32 ->
+                            // Integer inputs → Float32 output (preserve stacking precision)
+                            (XisfSampleFormat.Float32, true)
+                        | XisfSampleFormat.Float32 | XisfSampleFormat.Float64 ->
+                            // Float inputs → preserve format
+                            PixelIO.getRecommendedOutputFormat inputFormat
+                        | _ ->
+                            (XisfSampleFormat.Float32, true)
+
+                // Convert to output format using PixelIO
+                let stacked = PixelIO.writePixelsFromFloat stackedFloats outputFormat normalize
+
+                printfn $"Output format: {outputFormat}"
 
                 printfn "Building output metadata..."
 
@@ -662,13 +676,19 @@ let run (args: string array) =
                     |> List.choose id
                     |> Array.ofList
 
+                // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
+                let bounds =
+                    match PixelIO.getBoundsForFormat outputFormat with
+                    | Some b -> b
+                    | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+
                 let dataBlock = InlineDataBlock(ReadOnlyMemory(stacked), XisfEncoding.Base64)
                 let outImage = XisfImage(
                     firstImg.Geometry,
-                    firstImg.SampleFormat,
+                    outputFormat,
                     firstImg.ColorSpace,
                     dataBlock,
-                    firstImg.Bounds,
+                    bounds,
                     firstImg.PixelStorage,
                     firstImg.ImageType,
                     firstImg.Offset,

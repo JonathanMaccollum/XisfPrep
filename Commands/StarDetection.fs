@@ -114,7 +114,7 @@ let findConnectedComponents (residual: float[]) width height threshold =
     let components = ResizeArray<Component>()
 
     let floodFill startX startY label =
-        let component = { Id = label; Pixels = ResizeArray() }
+        let comp = { Id = label; Pixels = ResizeArray() }
         let stack = ResizeArray<int * int>()
         stack.Add((startX, startY))
 
@@ -126,15 +126,15 @@ let findConnectedComponents (residual: float[]) width height threshold =
                 let idx = y * width + x
                 if labels.[idx] = 0 && residual.[idx] > threshold then
                     labels.[idx] <- label
-                    component.Pixels.Add((x, y))
+                    comp.Pixels.Add((x, y))
 
                     stack.Add((x - 1, y))
                     stack.Add((x + 1, y))
                     stack.Add((x, y - 1))
                     stack.Add((x, y + 1))
 
-        if component.Pixels.Count > 0 then
-            components.Add(component)
+        if comp.Pixels.Count > 0 then
+            components.Add(comp)
 
     for y in 0 .. height - 1 do
         for x in 0 .. width - 1 do
@@ -264,10 +264,10 @@ let measureStar (values: float[]) (bgMap: float[]) (comp: Component) width heigh
             Saturated = saturated
         }
 
-let filterStar (star: DetectedStar) (params: DetectionParams) =
-    star.FWHM >= params.MinFWHM &&
-    star.FWHM <= params.MaxFWHM &&
-    star.Eccentricity <= params.MaxEccentricity &&
+let filterStar (star: DetectedStar) (settings: DetectionParams) =
+    star.FWHM >= settings.MinFWHM &&
+    star.FWHM <= settings.MaxFWHM &&
+    star.Eccentricity <= settings.MaxEccentricity &&
     not star.Saturated
 
 let testStarMeasurement (values: float[]) width height mad threshold =
@@ -406,10 +406,10 @@ let computeStarStatistics (stars: DetectedStar[]) channel channelName =
           MedianSNR = median snrs
           StdDevSNR = stdDev snrs }
 
-let detectStarsInChannel (values: float[]) width height mad channel channelName (params: DetectionParams) =
-    let bgMap = estimateLocalBackground values width height params.GridSize
+let detectStarsInChannel (values: float[]) width height mad channel channelName (settings: DetectionParams) =
+    let bgMap = estimateLocalBackground values width height settings.GridSize
     let residual = Array.init (width * height) (fun i -> values.[i] - bgMap.[i])
-    let thresholdValue = params.Threshold * mad
+    let thresholdValue = settings.Threshold * mad
     let components = findConnectedComponents residual width height thresholdValue
 
     let minSize = 3
@@ -417,10 +417,10 @@ let detectStarsInChannel (values: float[]) width height mad channel channelName 
         components
         |> Array.filter (fun c -> c.Pixels.Count >= minSize)
         |> Array.choose (fun c -> measureStar values bgMap c width height)
-        |> Array.filter (fun s -> filterStar s params)
+        |> Array.filter (fun s -> filterStar s settings)
 
     let cappedStars =
-        match params.MaxStars with
+        match settings.MaxStars with
         | Some max -> stars |> Array.sortByDescending (fun s -> s.Flux) |> Array.truncate max
         | None -> stars
 
@@ -444,11 +444,11 @@ let matchStars (stars1: DetectedStar[]) (stars2: DetectedStar[]) tolerance =
             matchCount <- matchCount + 1
     matchCount
 
-let detectStars (channelValues: (float[] * float * int * string)[]) width height (params: DetectionParams) =
+let detectStars (channelValues: (float[] * float * int * string)[]) width height (settings: DetectionParams) =
     let channelResults =
         channelValues
         |> Array.map (fun (values, mad, channel, channelName) ->
-            detectStarsInChannel values width height mad channel channelName params
+            detectStarsInChannel values width height mad channel channelName settings
         )
 
     let matchedCount =

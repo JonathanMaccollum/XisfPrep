@@ -7,7 +7,6 @@ open XisfLib.Core
 
 // Constants
 let VNG_KERNEL_BORDER = 2  // 5x5 kernel requires 2-pixel margin from image edges
-let BYTES_PER_UINT16 = 2   // uint16 values are stored as 2 bytes
 
 // Color channel indices
 type Channel = R = 0 | G = 1 | B = 2
@@ -38,6 +37,8 @@ let showHelp() =
     printfn $"  --suffix <text>           Output filename suffix (default: {defaultSuffix})"
     printfn "  --overwrite               Overwrite existing output files (default: skip existing)"
     printfn $"  --parallel <n>            Number of parallel operations (default: {defaultParallel} CPU cores)"
+    printfn "  --output-format <format>  Output sample format (default: preserve input format)"
+    printfn "                              uint8, uint16, uint32, float32, float64"
     printfn ""
     printfn "Algorithm:"
     printfn "  VNG (Variable Number of Gradients) - High quality gradient-based interpolation"
@@ -55,28 +56,32 @@ let showHelp() =
     printfn "  xisfprep debayer -i \"lights/*.xisf\" -o \"rgb/\" --pattern RGGB --overwrite"
 
 let parseArgs (args: string array) =
-    let rec parse (args: string list) input output pattern suffix overwrite maxParallel =
+    let rec parse (args: string list) input output pattern suffix overwrite maxParallel outputFormat =
         match args with
-        | [] -> (input, output, pattern, suffix, overwrite, maxParallel)
+        | [] -> (input, output, pattern, suffix, overwrite, maxParallel, outputFormat)
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output pattern suffix overwrite maxParallel
+            parse rest (Some value) output pattern suffix overwrite maxParallel outputFormat
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) pattern suffix overwrite maxParallel
+            parse rest input (Some value) pattern suffix overwrite maxParallel outputFormat
         | "--pattern" :: value :: rest | "-p" :: value :: rest ->
             let p = value.ToUpper()
             if not (p = "RGGB" || p = "BGGR" || p = "GRBG" || p = "GBRG") then
                 failwithf "Unknown Bayer pattern: %s (supported: RGGB, BGGR, GRBG, GBRG)" value
-            parse rest input output (Some p) suffix overwrite maxParallel
+            parse rest input output (Some p) suffix overwrite maxParallel outputFormat
         | "--suffix" :: value :: rest ->
-            parse rest input output pattern (Some value) overwrite maxParallel
+            parse rest input output pattern (Some value) overwrite maxParallel outputFormat
         | "--overwrite" :: rest ->
-            parse rest input output pattern suffix true maxParallel
+            parse rest input output pattern suffix true maxParallel outputFormat
         | "--parallel" :: value :: rest ->
-            parse rest input output pattern suffix overwrite (Some (int value))
+            parse rest input output pattern suffix overwrite (Some (int value)) outputFormat
+        | "--output-format" :: value :: rest ->
+            match PixelIO.parseOutputFormat value with
+            | Some fmt -> parse rest input output pattern suffix overwrite maxParallel (Some fmt)
+            | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
         | arg :: rest ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, pattern, suffix, overwrite, maxParallel) = parse (List.ofArray args) None None None None false None
+    let (input, output, pattern, suffix, overwrite, maxParallel, outputFormat) = parse (List.ofArray args) None None None None false None None
 
     let input = match input with Some v -> v | None -> failwith "Required argument: --input"
     let output = match output with Some v -> v | None -> failwith "Required argument: --output"
@@ -87,7 +92,7 @@ let parseArgs (args: string array) =
     if maxParallel < 1 then
         failwith "Parallel count must be at least 1"
 
-    (input, output, pattern, suffix, overwrite, maxParallel)
+    (input, output, pattern, suffix, overwrite, maxParallel, outputFormat)
 
 // Extract bayer pattern from image
 let getBayerPattern (img: XisfImage) (patternOverride: string option) =
@@ -133,8 +138,8 @@ let getColor x y pattern : Channel =
     | _ -> failwith "Unknown bayer pattern"
 
 // Compute gradient magnitude in a direction using 5x5 neighborhood
-let computeGradient (getPixel: int -> int -> uint16) x y dir =
-    let inline diff a b = abs (int a - int b)
+let computeGradient (getPixel: int -> int -> float) x y dir =
+    let inline diff a b = abs (a - b)
     match dir with
     | N  -> diff (getPixel x (y-1)) (getPixel x (y+1)) + diff (getPixel x (y-2)) (getPixel x y)
     | NE -> diff (getPixel (x+1) (y-1)) (getPixel (x-1) (y+1)) + diff (getPixel (x+2) (y-2)) (getPixel x y)
@@ -146,37 +151,21 @@ let computeGradient (getPixel: int -> int -> uint16) x y dir =
     | NW -> diff (getPixel (x-1) (y-1)) (getPixel (x+1) (y+1)) + diff (getPixel (x-2) (y-2)) (getPixel x y)
 
 // Helper to average values, with a fallback to a simple average if no valid directions are found
-let average (values: uint16 array) =
-    if values.Length > 0 then (values |> Array.map uint32 |> Array.sum) / (uint32 values.Length) |> uint16
-    else 0us
+let average (values: float array) =
+    if values.Length > 0 then Array.average values
+    else 0.0
 
-let getFallback (fallbackValues: uint16 array) =
-    if fallbackValues.Length > 0 then (fallbackValues |> Array.map uint32 |> Array.sum) / (uint32 fallbackValues.Length) |> uint16
-    else 0us
+let getFallback (fallbackValues: float array) =
+    if fallbackValues.Length > 0 then Array.average fallbackValues
+    else 0.0
 
-// Simple bilinear interpolation for border pixels (where 5x5 VNG kernel doesn't fit)
-let interpolateBorder (getPixel: int -> int -> uint16) (color: Channel) (value: uint16) =
-    match color with
-    | Channel.R ->
-        let g = (getPixel -1 0 + getPixel 1 0 + getPixel 0 -1 + getPixel 0 1) / 4us
-        let b = (getPixel -1 -1 + getPixel 1 -1 + getPixel -1 1 + getPixel 1 1) / 4us
-        (value, g, b)
-    | Channel.G ->
-        let r = (getPixel -1 0 + getPixel 1 0 + getPixel 0 -1 + getPixel 0 1) / 4us
-        let b = (getPixel -1 0 + getPixel 1 0 + getPixel 0 -1 + getPixel 0 1) / 4us
-        (r, value, b)
-    | Channel.B ->
-        let g = (getPixel -1 0 + getPixel 1 0 + getPixel 0 -1 + getPixel 0 1) / 4us
-        let r = (getPixel -1 -1 + getPixel 1 -1 + getPixel -1 1 + getPixel 1 1) / 4us
-        (r, g, value)
-    | _ -> failwith "Invalid channel"
 
 // VNG (Variable Number of Gradients) interpolation for interior pixels
-let interpolateVNG (getPixel: int -> int -> uint16) x y (color: Channel) (value: uint16) bayerPattern =
+let interpolateVNG (getPixel: int -> int -> float) x y (color: Channel) (value: float) bayerPattern =
     let gradients = allDirections |> Array.map (fun dir -> (dir, computeGradient getPixel x y dir))
     let minGrad = gradients |> Array.map snd |> Array.min
     let maxGrad = gradients |> Array.map snd |> Array.max
-    let threshold = minGrad + (maxGrad - minGrad) / 2
+    let threshold = minGrad + (maxGrad - minGrad) / 2.0
     let validDirs = gradients |> Array.filter (fun (_, g) -> g <= threshold) |> Array.map fst
     let validDirsSet = Set.ofArray validDirs
 
@@ -240,7 +229,7 @@ let interpolateVNG (getPixel: int -> int -> uint16) x y (color: Channel) (value:
 
     | _ -> failwith "Invalid channel"
 
-let debayerImage (inputPath: string) (outputDir: string) (patternOverride: string option) (suffix: string) (overwrite: bool) : Async<bool> =
+let debayerImage (inputPath: string) (outputDir: string) (patternOverride: string option) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) : Async<bool> =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -271,11 +260,9 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
             else
 
             let bayerPattern = getBayerPattern img patternOverride
-            let pixelData =
-                if img.PixelData :? InlineDataBlock then
-                    (img.PixelData :?> InlineDataBlock).Data.ToArray()
-                else
-                    failwith "Expected inline data"
+
+            // Read pixels using PixelIO (handles all sample formats)
+            let pixelFloats = PixelIO.readPixelsAsFloat img
 
             let width = int img.Geometry.Width
             let height = int img.Geometry.Height
@@ -284,34 +271,44 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 // Clamp coordinates to image bounds (replicate edge pixels)
                 let x' = max 0 (min (width - 1) x)
                 let y' = max 0 (min (height - 1) y)
-                let offset = (y' * width + x') * BYTES_PER_UINT16
-                uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8)
+                pixelFloats.[y' * width + x']
 
-            let debayered = Array.zeroCreate (width * height * 3 * 2)
+            // Output is 3 channels (RGB)
+            let debayeredFloats = Array.zeroCreate (width * height * 3)
 
-            for y = 0 to height - 1 do
-                for x = 0 to width - 1 do
-                    let outIdx = (y * width + x) * 3 * BYTES_PER_UINT16
+            // Pass 1: VNG interpolation for interior pixels
+            for y = VNG_KERNEL_BORDER to height - VNG_KERNEL_BORDER - 1 do
+                for x = VNG_KERNEL_BORDER to width - VNG_KERNEL_BORDER - 1 do
+                    let outIdx = (y * width + x) * 3
                     let color = getColor x y bayerPattern
                     let value = getPixel x y
+                    let r, g, b = interpolateVNG getPixel x y color value bayerPattern
+                    debayeredFloats.[outIdx + 0] <- r
+                    debayeredFloats.[outIdx + 1] <- g
+                    debayeredFloats.[outIdx + 2] <- b
 
-                    let r, g, b =
-                        // Check if we're in the border region where 5x5 VNG kernel doesn't fit
-                        if x < VNG_KERNEL_BORDER || x >= width - VNG_KERNEL_BORDER ||
-                           y < VNG_KERNEL_BORDER || y >= height - VNG_KERNEL_BORDER then
-                            // Border: use simple bilinear interpolation
-                            let getPixelRelative dx dy = getPixel (x + dx) (y + dy)
-                            interpolateBorder getPixelRelative color value
-                        else
-                            // Interior: use VNG with gradient-based interpolation
-                            interpolateVNG getPixel x y color value bayerPattern
+            // Pass 2: Edge replication for borders (copy nearest interior VNG result)
+            for y = 0 to height - 1 do
+                for x = 0 to width - 1 do
+                    let isBorder = x < VNG_KERNEL_BORDER || x >= width - VNG_KERNEL_BORDER ||
+                                   y < VNG_KERNEL_BORDER || y >= height - VNG_KERNEL_BORDER
+                    if isBorder then
+                        let outIdx = (y * width + x) * 3
+                        let srcX = max VNG_KERNEL_BORDER (min (width - VNG_KERNEL_BORDER - 1) x)
+                        let srcY = max VNG_KERNEL_BORDER (min (height - VNG_KERNEL_BORDER - 1) y)
+                        let srcIdx = (srcY * width + srcX) * 3
+                        debayeredFloats.[outIdx + 0] <- debayeredFloats.[srcIdx + 0]
+                        debayeredFloats.[outIdx + 1] <- debayeredFloats.[srcIdx + 1]
+                        debayeredFloats.[outIdx + 2] <- debayeredFloats.[srcIdx + 2]
 
-                    debayered.[outIdx + 0] <- byte r
-                    debayered.[outIdx + 1] <- byte (r >>> 8)
-                    debayered.[outIdx + 2] <- byte g
-                    debayered.[outIdx + 3] <- byte (g >>> 8)
-                    debayered.[outIdx + 4] <- byte b
-                    debayered.[outIdx + 5] <- byte (b >>> 8)
+            // Determine output format (use override or preserve input format)
+            let (outputFormat, normalize) =
+                match outputFormatOverride with
+                | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
+                | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
+
+            // Write output using PixelIO
+            let debayered = PixelIO.writePixelsFromFloat debayeredFloats outputFormat normalize
 
             let rgbGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
             let dataBlock = InlineDataBlock(ReadOnlyMemory(debayered), XisfEncoding.Base64)
@@ -338,12 +335,18 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 if filteredAndUpdatedElements.Length = 0 then null
                 else filteredAndUpdatedElements :> System.Collections.Generic.IReadOnlyList<_>
 
+            // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
+            let bounds =
+                match PixelIO.getBoundsForFormat outputFormat with
+                | Some b -> b
+                | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+
             let rgbImage = XisfImage(
                 rgbGeometry,
-                img.SampleFormat,
+                outputFormat,
                 XisfColorSpace.RGB,
                 dataBlock,
-                img.Bounds,
+                bounds,
                 XisfPixelStorage.Normal,
                 img.ImageType,
                 img.Offset,
@@ -378,7 +381,7 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputDir, patternOverride, suffix, overwrite, maxParallel) = parseArgs args
+                let (inputPattern, outputDir, patternOverride, suffix, overwrite, maxParallel, outputFormat) = parseArgs args
 
                 Log.Information($"Debayering images using VNG algorithm")
 
@@ -404,7 +407,7 @@ let run (args: string array) =
                         printfn ""
 
                         // Process all files in parallel with max parallelism limit
-                        let tasks = files |> Array.map (fun f -> debayerImage f outputDir patternOverride suffix overwrite)
+                        let tasks = files |> Array.map (fun f -> debayerImage f outputDir patternOverride suffix overwrite outputFormat)
                         let! results = Async.Parallel(tasks, maxDegreeOfParallelism = maxParallel)
 
                         let successCount = results |> Array.filter id |> Array.length

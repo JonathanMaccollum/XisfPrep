@@ -462,11 +462,8 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
                 else
                     "embedded"
 
-            let pixelData =
-                if img.PixelData :? InlineDataBlock then
-                    (img.PixelData :?> InlineDataBlock).Data.ToArray()
-                else
-                    failwith "Expected inline data"
+            // Read pixels using PixelIO (handles all sample formats)
+            let pixelFloats = PixelIO.readPixelsAsFloat img
 
             let width = int img.Geometry.Width
             let height = int img.Geometry.Height
@@ -476,8 +473,7 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
             let channelStats =
                 Array.init channels (fun ch ->
                     let values = Array.init pixelCount (fun pix ->
-                        let offset = (pix * channels * 2) + (ch * 2)
-                        float (uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8))
+                        pixelFloats.[pix * channels + ch]
                     )
 
                     let (min, max, mean, median, stdDev) = calculateStats values
@@ -520,8 +516,7 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
                         let channelData =
                             Array.init channels (fun ch ->
                                 let values = Array.init pixelCount (fun pix ->
-                                    let offset = (pix * channels * 2) + (ch * 2)
-                                    float (uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8))
+                                    pixelFloats.[pix * channels + ch]
                                 )
                                 let stats = channelStats.[ch]
                                 let mad = stats.MAD |> Option.defaultValue (calculateMAD values stats.Median)

@@ -25,6 +25,7 @@ type CalibrationConfig = {
     Overwrite: bool
     DryRun: bool
     MaxParallel: int
+    OutputFormat: XisfSampleFormat option
 }
 
 type MasterFrames = {
@@ -63,6 +64,8 @@ let showHelp() =
     printfn "  --overwrite               Overwrite existing output files"
     printfn "  --dry-run                 Show what would be done without processing"
     printfn "  --parallel <n>            Number of parallel operations (default: CPU cores)"
+    printfn "  --output-format <format>  Output sample format (default: preserve input format)"
+    printfn "                              uint8, uint16, uint32, float32, float64"
     printfn ""
     printfn "Algorithm:"
     printfn "  Output = ((Light - Bias - Dark) / Flat) + Pedestal"
@@ -81,40 +84,44 @@ let showHelp() =
     printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"adjusted/\" --pedestal 100"
 
 let parseArgs (args: string array) =
-    let rec parse (args: string list) input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel =
+    let rec parse (args: string list) input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat =
         match args with
-        | [] -> (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel)
+        | [] -> (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel, outputFormat)
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest (Some value) output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input (Some value) bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--bias" :: value :: rest | "-b" :: value :: rest ->
-            parse rest input output (Some value) biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input output (Some value) biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--bias-level" :: value :: rest ->
-            parse rest input output bias (Some (float value)) dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input output bias (Some (float value)) dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--dark" :: value :: rest | "-d" :: value :: rest ->
-            parse rest input output bias biasLevel (Some value) flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input output bias biasLevel (Some value) flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--flat" :: value :: rest | "-f" :: value :: rest ->
-            parse rest input output bias biasLevel dark (Some value) uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input output bias biasLevel dark (Some value) uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--uncalibrated-dark" :: rest ->
-            parse rest input output bias biasLevel dark flat true uncalFlat pedestal suffix overwrite dryRun maxParallel
+            parse rest input output bias biasLevel dark flat true uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--uncalibrated-flat" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark true pedestal suffix overwrite dryRun maxParallel
+            parse rest input output bias biasLevel dark flat uncalDark true pedestal suffix overwrite dryRun maxParallel outputFormat
         | "--pedestal" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat (Some (int value)) suffix overwrite dryRun maxParallel
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat (Some (int value)) suffix overwrite dryRun maxParallel outputFormat
         | "--suffix" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal (Some value) overwrite dryRun maxParallel
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal (Some value) overwrite dryRun maxParallel outputFormat
         | "--overwrite" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix true dryRun maxParallel
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix true dryRun maxParallel outputFormat
         | "--dry-run" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite true maxParallel
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite true maxParallel outputFormat
         | "--parallel" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun (Some (int value))
+            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun (Some (int value)) outputFormat
+        | "--output-format" :: value :: rest ->
+            match PixelIO.parseOutputFormat value with
+            | Some fmt -> parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel (Some fmt)
+            | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
         | arg :: rest ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel) =
-        parse (List.ofArray args) None None None None None None false false None None false false None
+    let (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel, outputFormat) =
+        parse (List.ofArray args) None None None None None None false false None None false false None None
 
     // Validation
     let input = match input with Some v -> v | None -> failwith "Required argument: --input"
@@ -156,6 +163,7 @@ let parseArgs (args: string array) =
         Overwrite = overwrite
         DryRun = dryRun
         MaxParallel = maxParallel
+        OutputFormat = outputFormat
     }
 
 let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
@@ -171,20 +179,8 @@ let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
         let height = int img.Geometry.Height
         let channels = int img.Geometry.ChannelCount
 
-        let pixelData =
-            if img.PixelData :? InlineDataBlock then
-                (img.PixelData :?> InlineDataBlock).Data.ToArray()
-            else
-                failwithf "Expected inline data in %s" path
-
-        let pixelCount = width * height * channels
-        let floatData = Array.zeroCreate pixelCount
-
-        // Convert UInt16 to float
-        for i = 0 to pixelCount - 1 do
-            let offset = i * 2
-            let value = uint16 pixelData.[offset] ||| (uint16 pixelData.[offset + 1] <<< 8)
-            floatData.[i] <- float value
+        // Use PixelIO to read pixels in any format (UInt8, UInt16, UInt32, Float32, Float64)
+        let floatData = PixelIO.readPixelsAsFloat img
 
         return (floatData, width, height, channels)
     }
@@ -352,14 +348,16 @@ let getBiasValue (masters: MasterFrames) (config: CalibrationConfig) (index: int
     | None, Some level -> level
     | None, None -> 0.0
 
-let processPixels (lightPixelData: byte[]) (masters: MasterFrames) (config: CalibrationConfig) (pixelCount: int) =
-    let calibratedData = Array.zeroCreate (pixelCount * 2)
+let processPixels (lightImg: XisfImage) (masters: MasterFrames) (config: CalibrationConfig) (pixelCount: int) (outputFormat: XisfSampleFormat) (normalize: bool) =
+    // Read light frame pixels using PixelIO (handles all sample formats)
+    let lightPixels = PixelIO.readPixelsAsFloat lightImg
+
+    let calibratedFloats = Array.zeroCreate pixelCount
     let mutable zeroCount = 0
     let mutable flatZeroCount = 0
 
     for i = 0 to pixelCount - 1 do
-        let offset = i * 2
-        let lightValue = float (uint16 lightPixelData.[offset] ||| (uint16 lightPixelData.[offset + 1] <<< 8))
+        let lightValue = lightPixels.[i]
         let biasValue = getBiasValue masters config i
         let darkValue = masters.DarkData |> Option.map (fun data -> data.[i])
         let flatValue = masters.FlatData |> Option.map (fun data -> data.[i])
@@ -372,8 +370,10 @@ let processPixels (lightPixelData: byte[]) (masters: MasterFrames) (config: Cali
         if calibrated = 0us then
             zeroCount <- zeroCount + 1
 
-        calibratedData.[offset] <- byte (calibrated &&& 0xFFus)
-        calibratedData.[offset + 1] <- byte ((calibrated >>> 8) &&& 0xFFus)
+        calibratedFloats.[i] <- float calibrated
+
+    // Write calibrated pixels in requested format (preserves input format by default)
+    let calibratedData = PixelIO.writePixelsFromFloat calibratedFloats outputFormat normalize
 
     (calibratedData, zeroCount, flatZeroCount)
 
@@ -390,7 +390,7 @@ let logClippingWarnings (zeroCount: int) (flatZeroCount: int) (pixelCount: int) 
         if pct > 1.0 then
             Log.Warning("Output has {Count} zero pixels ({Pct:F2}%) - consider increasing --pedestal", zeroCount, pct)
 
-let createCalibratedImage (lightImg: XisfImage) (calibratedData: byte[]) (config: CalibrationConfig) =
+let createCalibratedImage (lightImg: XisfImage) (calibratedData: byte[]) (config: CalibrationConfig) (outputFormat: XisfSampleFormat) =
     let dataBlock = InlineDataBlock(ReadOnlyMemory(calibratedData), XisfEncoding.Base64)
 
     let historyEntries = buildCalibrationHistory config
@@ -409,12 +409,18 @@ let createCalibratedImage (lightImg: XisfImage) (calibratedData: byte[]) (config
 
     let allProps = Array.append existingProps (Array.ofList calibrationProps)
 
+    // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
+    let bounds =
+        match PixelIO.getBoundsForFormat outputFormat with
+        | Some b -> b
+        | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+
     XisfImage(
         lightImg.Geometry,
-        lightImg.SampleFormat,
+        outputFormat,
         lightImg.ColorSpace,
         dataBlock,
-        lightImg.Bounds,
+        bounds,
         lightImg.PixelStorage,
         lightImg.ImageType,
         lightImg.Offset,
@@ -443,19 +449,20 @@ let calibrateImage (lightPath: string) (masters: MasterFrames) (config: Calibrat
             failwithf "Light frame dimension mismatch: Expected %dx%dx%d, got %dx%dx%d in %s"
                 masters.Width masters.Height masters.Channels width height channels lightPath
 
-        // Get light pixel data
-        let lightPixelData =
-            if lightImg.PixelData :? InlineDataBlock then
-                (lightImg.PixelData :?> InlineDataBlock).Data.ToArray()
-            else
-                failwithf "Expected inline data in %s" lightPath
-
         let pixelCount = width * height * channels
-        let (calibratedData, zeroCount, flatZeroCount) = processPixels lightPixelData masters config pixelCount
+
+        // Determine output format (use override or preserve input format)
+        let (outputFormat, normalize) =
+            match config.OutputFormat with
+            | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
+            | None -> PixelIO.getRecommendedOutputFormat lightImg.SampleFormat
+
+        // Process pixels using PixelIO (handles all sample formats)
+        let (calibratedData, zeroCount, flatZeroCount) = processPixels lightImg masters config pixelCount outputFormat normalize
 
         logClippingWarnings zeroCount flatZeroCount pixelCount
 
-        return createCalibratedImage lightImg calibratedData config
+        return createCalibratedImage lightImg calibratedData config outputFormat
     }
 
 let processFile (filePath: string) (masters: MasterFrames) (config: CalibrationConfig) : Async<Result<string, string>> =
