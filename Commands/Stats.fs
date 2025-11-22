@@ -4,6 +4,7 @@ open System
 open System.IO
 open Serilog
 open XisfLib.Core
+open Algorithms.Statistics
 
 type MetricsLevel =
     | Basic
@@ -220,61 +221,6 @@ let parseArgs (args: string array) : StatsOptions =
         | _ -> ()
 
     opts
-
-let calculateStats (values: float[]) =
-    if Array.isEmpty values then
-        (0.0, 0.0, 0.0, 0.0, 0.0)
-    else
-        let min = Array.min values
-        let max = Array.max values
-        let mean = Array.average values
-
-        let sorted = Array.copy values
-        Array.sortInPlace sorted
-        let median =
-            let mid = sorted.Length / 2
-            if sorted.Length % 2 = 0 then
-                (sorted.[mid - 1] + sorted.[mid]) / 2.0
-            else
-                sorted.[mid]
-
-        let variance = values |> Array.sumBy (fun x -> (x - mean) * (x - mean))
-        let stdDev = sqrt (variance / float values.Length)
-
-        (min, max, mean, median, stdDev)
-
-let calculateHistogram (values: float[]) (bins: int) =
-    if Array.isEmpty values then
-        Array.zeroCreate bins
-    else
-        let minVal = Array.min values
-        let maxVal = Array.max values
-        let range = maxVal - minVal
-        let histogram = Array.zeroCreate bins
-
-        if range > 0.0 then
-            for value in values do
-                let binIndex = int ((value - minVal) / range * float (bins - 1))
-                let clampedIndex = min (bins - 1) (max 0 binIndex)
-                histogram.[clampedIndex] <- histogram.[clampedIndex] + 1
-
-        histogram
-
-let calculateMAD (values: float[]) (median: float) =
-    if Array.isEmpty values then
-        0.0
-    else
-        let deviations = values |> Array.map (fun v -> abs (v - median))
-        let sorted = Array.sort deviations
-        let mid = sorted.Length / 2
-        if sorted.Length % 2 = 0 then
-            (sorted.[mid - 1] + sorted.[mid]) / 2.0
-        else
-            sorted.[mid]
-
-let calculateSNR (mean: float) (stdDev: float) =
-    if stdDev > 0.0 then mean / stdDev
-    else 0.0
 
 // Step 1: Check if an element is the FITS keyword we want
 let tryGetFitsKeywordValue (keywordName: string) (elem: XisfCoreElement) : string option =
@@ -499,7 +445,7 @@ let analyzeImage (filePath: string) (metricsLevel: MetricsLevel) (detectStars: b
                         pixelFloats.[pix * channels + ch]
                     )
 
-                    let (min, max, mean, median, stdDev) = calculateStats values
+                    let (min, max, mean, median, stdDev) = calculateBasicStats values
                     let madValue = calculateMAD values median
 
                     let mad =

@@ -22,6 +22,7 @@ let showUsage() =
     printfn "Commands:"
     printfn "  calibrate   Apply bias/dark/flat calibration frames"
     printfn "  debayer     Convert Bayer mosaic to RGB"
+    printfn "  headers     Extract FITS keywords and HISTORY values"
     printfn "  align       Register images to reference"
     printfn "  integrate   Stack/combine multiple images"
     printfn "  stats       Calculate image statistics"
@@ -39,6 +40,7 @@ let commandHandlers =
     Map.ofList [
         "calibrate", Commands.Calibrate.run
         "debayer", Commands.Debayer.run
+        "headers", Commands.Headers.run
         "align", Commands.Align.run
         "integrate", Commands.Integrate.run
         "stats", Commands.Stats.run
