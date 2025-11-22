@@ -83,88 +83,88 @@ let showHelp() =
     printfn "  # Pedestal only (shift histogram)"
     printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"adjusted/\" --pedestal 100"
 
-let parseArgs (args: string array) =
-    let rec parse (args: string list) input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat =
+let parseArgs (args: string array) : CalibrationConfig =
+    let rec parse (args: string list) (cfg: CalibrationConfig) =
         match args with
-        | [] -> (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel, outputFormat)
+        | [] -> cfg
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with InputPattern = value }
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with OutputDir = value }
         | "--bias" :: value :: rest | "-b" :: value :: rest ->
-            parse rest input output (Some value) biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with BiasFrame = Some value }
         | "--bias-level" :: value :: rest ->
-            parse rest input output bias (Some (float value)) dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with BiasLevel = Some (float value) }
         | "--dark" :: value :: rest | "-d" :: value :: rest ->
-            parse rest input output bias biasLevel (Some value) flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with DarkFrame = Some value }
         | "--flat" :: value :: rest | "-f" :: value :: rest ->
-            parse rest input output bias biasLevel dark (Some value) uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with FlatFrame = Some value }
         | "--uncalibrated-dark" :: rest ->
-            parse rest input output bias biasLevel dark flat true uncalFlat pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with UncalibratedDark = true }
         | "--uncalibrated-flat" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark true pedestal suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with UncalibratedFlat = true }
         | "--pedestal" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat (Some (int value)) suffix overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with OutputPedestal = int value }
         | "--suffix" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal (Some value) overwrite dryRun maxParallel outputFormat
+            parse rest { cfg with Suffix = value }
         | "--overwrite" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix true dryRun maxParallel outputFormat
+            parse rest { cfg with Overwrite = true }
         | "--dry-run" :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite true maxParallel outputFormat
+            parse rest { cfg with DryRun = true }
         | "--parallel" :: value :: rest ->
-            parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun (Some (int value)) outputFormat
+            parse rest { cfg with MaxParallel = int value }
         | "--output-format" :: value :: rest ->
             match PixelIO.parseOutputFormat value with
-            | Some fmt -> parse rest input output bias biasLevel dark flat uncalDark uncalFlat pedestal suffix overwrite dryRun maxParallel (Some fmt)
+            | Some fmt -> parse rest { cfg with OutputFormat = Some fmt }
             | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
-        | arg :: rest ->
+        | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, bias, biasLevel, dark, flat, uncalDark, uncalFlat, pedestal, suffix, overwrite, dryRun, maxParallel, outputFormat) =
-        parse (List.ofArray args) None None None None None None false false None None false false None None
+    let defaults = {
+        InputPattern = ""
+        OutputDir = ""
+        BiasFrame = None
+        BiasLevel = None
+        DarkFrame = None
+        FlatFrame = None
+        UncalibratedDark = false
+        UncalibratedFlat = false
+        OutputPedestal = defaultPedestal
+        Suffix = defaultSuffix
+        Overwrite = false
+        DryRun = false
+        MaxParallel = defaultParallel
+        OutputFormat = None
+    }
+
+    let cfg = parse (List.ofArray args) defaults
 
     // Validation
-    let input = match input with Some v -> v | None -> failwith "Required argument: --input"
-    let output = match output with Some v -> v | None -> failwith "Required argument: --output"
+    if String.IsNullOrEmpty cfg.InputPattern then failwith "Required argument: --input"
+    if String.IsNullOrEmpty cfg.OutputDir then failwith "Required argument: --output"
 
-    if bias.IsSome && biasLevel.IsSome then
+    if cfg.BiasFrame.IsSome && cfg.BiasLevel.IsSome then
         failwith "--bias and --bias-level are mutually exclusive"
 
-    if bias.IsNone && biasLevel.IsNone && dark.IsNone && flat.IsNone && pedestal.IsNone then
+    if cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone && cfg.DarkFrame.IsNone && cfg.FlatFrame.IsNone && cfg.OutputPedestal = 0 then
         failwith "At least one of --bias, --bias-level, --dark, --flat, or --pedestal required"
 
-    if uncalDark && bias.IsNone && biasLevel.IsNone then
+    if cfg.UncalibratedDark && cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone then
         failwith "--uncalibrated-dark requires --bias or --bias-level"
 
-    if uncalFlat && bias.IsNone && biasLevel.IsNone then
+    if cfg.UncalibratedFlat && cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone then
         failwith "--uncalibrated-flat requires --bias or --bias-level"
 
-    if uncalFlat && dark.IsNone then
+    if cfg.UncalibratedFlat && cfg.DarkFrame.IsNone then
         failwith "--uncalibrated-flat requires --dark"
 
-    let pedestal = pedestal |> Option.defaultValue defaultPedestal
-    if pedestal < 0 || pedestal > 65535 then
+    if cfg.OutputPedestal < 0 || cfg.OutputPedestal > 65535 then
         failwith "Pedestal must be in range [0, 65535]"
 
-    let suffix = suffix |> Option.defaultValue defaultSuffix
-    let maxParallel = maxParallel |> Option.defaultValue defaultParallel
+    if cfg.MaxParallel < 1 then
+        failwith "Parallel count must be at least 1"
 
-    {
-        InputPattern = input
-        OutputDir = output
-        BiasFrame = bias
-        BiasLevel = biasLevel
-        DarkFrame = dark
-        FlatFrame = flat
-        UncalibratedDark = uncalDark
-        UncalibratedFlat = uncalFlat
-        OutputPedestal = pedestal
-        Suffix = suffix
-        Overwrite = overwrite
-        DryRun = dryRun
-        MaxParallel = maxParallel
-        OutputFormat = outputFormat
-    }
+    cfg
 
 let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
     async {

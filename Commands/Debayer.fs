@@ -22,6 +22,17 @@ let private defaultSuffix = "_d"
 let private defaultParallel = System.Environment.ProcessorCount
 // ---
 
+type DebayerOptions = {
+    Input: string
+    Output: string
+    Pattern: string option
+    Suffix: string
+    Overwrite: bool
+    MaxParallel: int
+    OutputFormat: XisfSampleFormat option
+    Split: bool
+}
+
 let showHelp() =
     printfn "debayer - Convert Bayer mosaic to RGB using VNG interpolation"
     printfn ""
@@ -35,6 +46,8 @@ let showHelp() =
     printfn $"  --pattern, -p <pattern>   Bayer pattern override (default: auto-detect from FITS, fallback {defaultPattern})"
     printfn "                              Supported: RGGB, BGGR, GRBG, GBRG"
     printfn $"  --suffix <text>           Output filename suffix (default: {defaultSuffix})"
+    printfn "  --split                   Output as separate R, G, B monochrome files"
+    printfn "                              Creates _R.xisf, _G.xisf, _B.xisf instead of RGB"
     printfn "  --overwrite               Overwrite existing output files (default: skip existing)"
     printfn $"  --parallel <n>            Number of parallel operations (default: {defaultParallel} CPU cores)"
     printfn "  --output-format <format>  Output sample format (default: preserve input format)"
@@ -48,51 +61,60 @@ let showHelp() =
     printfn "  1. Validates input is single-channel monochrome"
     printfn "  2. Reads Bayer pattern from FITS BAYERPAT keyword or uses override"
     printfn "  3. Applies VNG interpolation"
-    printfn "  4. Outputs 3-channel RGB image"
+    printfn "  4. Outputs 3-channel RGB image (or separate R/G/B with --split)"
     printfn "  5. Removes ColorFilterArray and Bayer FITS keywords from output"
     printfn ""
     printfn "Examples:"
     printfn "  xisfprep debayer -i \"lights/*.xisf\" -o \"rgb/\""
     printfn "  xisfprep debayer -i \"lights/*.xisf\" -o \"rgb/\" --pattern RGGB --overwrite"
+    printfn "  xisfprep debayer -i \"lights/*.xisf\" -o \"mono/\" --split"
 
-let parseArgs (args: string array) =
-    let rec parse (args: string list) input output pattern suffix overwrite maxParallel outputFormat =
+let parseArgs (args: string array) : DebayerOptions =
+    let rec parse (args: string list) (opts: DebayerOptions) =
         match args with
-        | [] -> (input, output, pattern, suffix, overwrite, maxParallel, outputFormat)
+        | [] -> opts
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output pattern suffix overwrite maxParallel outputFormat
+            parse rest { opts with Input = value }
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) pattern suffix overwrite maxParallel outputFormat
+            parse rest { opts with Output = value }
         | "--pattern" :: value :: rest | "-p" :: value :: rest ->
             let p = value.ToUpper()
             if not (p = "RGGB" || p = "BGGR" || p = "GRBG" || p = "GBRG") then
                 failwithf "Unknown Bayer pattern: %s (supported: RGGB, BGGR, GRBG, GBRG)" value
-            parse rest input output (Some p) suffix overwrite maxParallel outputFormat
+            parse rest { opts with Pattern = Some p }
         | "--suffix" :: value :: rest ->
-            parse rest input output pattern (Some value) overwrite maxParallel outputFormat
+            parse rest { opts with Suffix = value }
         | "--overwrite" :: rest ->
-            parse rest input output pattern suffix true maxParallel outputFormat
+            parse rest { opts with Overwrite = true }
         | "--parallel" :: value :: rest ->
-            parse rest input output pattern suffix overwrite (Some (int value)) outputFormat
+            parse rest { opts with MaxParallel = int value }
         | "--output-format" :: value :: rest ->
             match PixelIO.parseOutputFormat value with
-            | Some fmt -> parse rest input output pattern suffix overwrite maxParallel (Some fmt)
+            | Some fmt -> parse rest { opts with OutputFormat = Some fmt }
             | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
-        | arg :: rest ->
+        | "--split" :: rest ->
+            parse rest { opts with Split = true }
+        | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, pattern, suffix, overwrite, maxParallel, outputFormat) = parse (List.ofArray args) None None None None false None None
+    let defaults = {
+        Input = ""
+        Output = ""
+        Pattern = None
+        Suffix = defaultSuffix
+        Overwrite = false
+        MaxParallel = defaultParallel
+        OutputFormat = None
+        Split = false
+    }
 
-    let input = match input with Some v -> v | None -> failwith "Required argument: --input"
-    let output = match output with Some v -> v | None -> failwith "Required argument: --output"
-    let pattern = pattern  // Option<string> - None means auto-detect
-    let suffix = suffix |> Option.defaultValue defaultSuffix
-    let maxParallel = maxParallel |> Option.defaultValue defaultParallel
+    let opts = parse (List.ofArray args) defaults
 
-    if maxParallel < 1 then
-        failwith "Parallel count must be at least 1"
+    if String.IsNullOrEmpty opts.Input then failwith "Required argument: --input"
+    if String.IsNullOrEmpty opts.Output then failwith "Required argument: --output"
+    if opts.MaxParallel < 1 then failwith "Parallel count must be at least 1"
 
-    (input, output, pattern, suffix, overwrite, maxParallel, outputFormat)
+    opts
 
 // Extract bayer pattern from image
 let getBayerPattern (img: XisfImage) (patternOverride: string option) =
@@ -229,18 +251,34 @@ let interpolateVNG (getPixel: int -> int -> float) x y (color: Channel) (value: 
 
     | _ -> failwith "Invalid channel"
 
-let debayerImage (inputPath: string) (outputDir: string) (patternOverride: string option) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) : Async<bool> =
+let debayerImage (inputPath: string) (outputDir: string) (patternOverride: string option) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) (split: bool) : Async<bool> =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
             let baseName = Path.GetFileNameWithoutExtension(inputPath)
-            let outFileName = $"{baseName}{suffix}.xisf"
-            let outPath = Path.Combine(outputDir, outFileName)
 
-            // Check if output file exists and skip if not overwriting
-            if File.Exists(outPath) && not overwrite then
-                Log.Warning($"Output file '{outFileName}' already exists, skipping (use --overwrite to replace)")
-                return true  // Return true to not count as failure
+            // Check output files based on split mode
+            let shouldSkip =
+                if split then
+                    let outPaths = [| "_R"; "_G"; "_B" |] |> Array.map (fun ch ->
+                        let outFileName = $"{baseName}{suffix}{ch}.xisf"
+                        Path.Combine(outputDir, outFileName))
+                    let existingFiles = outPaths |> Array.filter File.Exists
+                    if existingFiles.Length > 0 && not overwrite then
+                        for f in existingFiles do
+                            Log.Warning($"Output file '{Path.GetFileName(f)}' already exists, skipping (use --overwrite to replace)")
+                        true
+                    else false
+                else
+                    let outFileName = $"{baseName}{suffix}.xisf"
+                    let outPath = Path.Combine(outputDir, outFileName)
+                    if File.Exists(outPath) && not overwrite then
+                        Log.Warning($"Output file '{outFileName}' already exists, skipping (use --overwrite to replace)")
+                        true
+                    else false
+
+            if shouldSkip then
+                return true
             else
 
             printfn $"Processing: {fileName}"
@@ -307,19 +345,14 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
                 | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
 
-            // Write output using PixelIO
-            let debayered = PixelIO.writePixelsFromFloat debayeredFloats outputFormat normalize
-
-            let rgbGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
-            let dataBlock = InlineDataBlock(ReadOnlyMemory(debayered), XisfEncoding.Base64)
-
             // Filter out ColorFilterArray and Bayer-related FITS keywords - debayered images are no longer mosaiced
             let bayerKeywords = Set.ofList ["BAYERPAT"; "XBAYROFF"; "YBAYROFF"]
 
             let historyEntry = $"Debayered using VNG algorithm (pattern: {bayerPattern})"
-            let filteredAndUpdatedElements =
+
+            let filterElements (additionalKeywords: XisfFitsKeyword array) =
                 if isNull img.AssociatedElements then
-                    [| XisfFitsKeyword("HISTORY", "", historyEntry) :> XisfCoreElement |]
+                    additionalKeywords |> Array.map (fun k -> k :> XisfCoreElement)
                 else
                     let filtered =
                         img.AssociatedElements
@@ -329,11 +362,7 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                             | :? XisfColorFilterArray -> false
                             | :? XisfFitsKeyword as fits -> not (bayerKeywords.Contains fits.Name)
                             | _ -> true)
-                    Array.append filtered [| XisfFitsKeyword("HISTORY", "", historyEntry) :> XisfCoreElement |]
-
-            let filteredElements =
-                if filteredAndUpdatedElements.Length = 0 then null
-                else filteredAndUpdatedElements :> System.Collections.Generic.IReadOnlyList<_>
+                    Array.append filtered (additionalKeywords |> Array.map (fun k -> k :> XisfCoreElement))
 
             // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
             let bounds =
@@ -341,30 +370,101 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 | Some b -> b
                 | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
 
-            let rgbImage = XisfImage(
-                rgbGeometry,
-                outputFormat,
-                XisfColorSpace.RGB,
-                dataBlock,
-                bounds,
-                XisfPixelStorage.Normal,
-                img.ImageType,
-                img.Offset,
-                img.Orientation,
-                img.ImageId,
-                img.Uuid,
-                img.Properties,
-                filteredElements
-            )
+            if split then
+                // Split into three separate monochrome files
+                let channelNames = [| ("R", "Red"); ("G", "Green"); ("B", "Blue") |]
+                let pixelCount = width * height
 
-            let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Debayer v1.0")
-            let outUnit = XisfFactory.CreateMonolithic(metadata, rgbImage)
+                for i in 0 .. 2 do
+                    let (chSuffix, filterName) = channelNames.[i]
+                    let outFileName = $"{baseName}{suffix}_{chSuffix}.xisf"
+                    let outPath = Path.Combine(outputDir, outFileName)
 
-            let writer = new XisfWriter()
-            do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
+                    // Extract single channel from interleaved RGB data
+                    let channelFloats = Array.zeroCreate pixelCount
+                    for p in 0 .. pixelCount - 1 do
+                        channelFloats.[p] <- debayeredFloats.[p * 3 + i]
 
-            let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
-            printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} RGB)"
+                    let channelBytes = PixelIO.writePixelsFromFloat channelFloats outputFormat normalize
+
+                    let monoGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 1u)
+                    let dataBlock = InlineDataBlock(ReadOnlyMemory(channelBytes), XisfEncoding.Base64)
+
+                    // Add FILTER keyword and HISTORY
+                    let additionalKeywords = [|
+                        XisfFitsKeyword("FILTER", "", filterName)
+                        XisfFitsKeyword("HISTORY", "", historyEntry)
+                    |]
+                    let elements = filterElements additionalKeywords
+                    let elementsList =
+                        if elements.Length = 0 then null
+                        else elements :> System.Collections.Generic.IReadOnlyList<_>
+
+                    let monoImage = XisfImage(
+                        monoGeometry,
+                        outputFormat,
+                        XisfColorSpace.Gray,
+                        dataBlock,
+                        bounds,
+                        XisfPixelStorage.Normal,
+                        img.ImageType,
+                        img.Offset,
+                        img.Orientation,
+                        img.ImageId,
+                        img.Uuid,
+                        img.Properties,
+                        elementsList
+                    )
+
+                    let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Debayer v1.0")
+                    let outUnit = XisfFactory.CreateMonolithic(metadata, monoImage)
+
+                    let writer = new XisfWriter()
+                    do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
+
+                    let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
+                    printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} Mono)"
+
+            else
+                // Standard RGB output
+                let outFileName = $"{baseName}{suffix}.xisf"
+                let outPath = Path.Combine(outputDir, outFileName)
+
+                let debayered = PixelIO.writePixelsFromFloat debayeredFloats outputFormat normalize
+
+                let rgbGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
+                let dataBlock = InlineDataBlock(ReadOnlyMemory(debayered), XisfEncoding.Base64)
+
+                let additionalKeywords = [| XisfFitsKeyword("HISTORY", "", historyEntry) |]
+                let elements = filterElements additionalKeywords
+                let filteredElements =
+                    if elements.Length = 0 then null
+                    else elements :> System.Collections.Generic.IReadOnlyList<_>
+
+                let rgbImage = XisfImage(
+                    rgbGeometry,
+                    outputFormat,
+                    XisfColorSpace.RGB,
+                    dataBlock,
+                    bounds,
+                    XisfPixelStorage.Normal,
+                    img.ImageType,
+                    img.Offset,
+                    img.Orientation,
+                    img.ImageId,
+                    img.Uuid,
+                    img.Properties,
+                    filteredElements
+                )
+
+                let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Debayer v1.0")
+                let outUnit = XisfFactory.CreateMonolithic(metadata, rgbImage)
+
+                let writer = new XisfWriter()
+                do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
+
+                let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
+                printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} RGB)"
 
             return true
         with ex ->
@@ -381,16 +481,16 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputDir, patternOverride, suffix, overwrite, maxParallel, outputFormat) = parseArgs args
+                let opts = parseArgs args
 
                 Log.Information($"Debayering images using VNG algorithm")
 
-                if not (Directory.Exists(outputDir)) then
-                    Directory.CreateDirectory(outputDir) |> ignore
-                    Log.Information($"Created output directory: {outputDir}")
+                if not (Directory.Exists(opts.Output)) then
+                    Directory.CreateDirectory(opts.Output) |> ignore
+                    Log.Information($"Created output directory: {opts.Output}")
 
-                let inputDir = Path.GetDirectoryName(inputPattern)
-                let pattern = Path.GetFileName(inputPattern)
+                let inputDir = Path.GetDirectoryName(opts.Input)
+                let pattern = Path.GetFileName(opts.Input)
                 let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
 
                 if not (Directory.Exists(actualDir)) then
@@ -400,15 +500,16 @@ let run (args: string array) =
                     let files = Directory.GetFiles(actualDir, pattern)
 
                     if files.Length = 0 then
-                        Log.Error($"No files found matching pattern: {inputPattern}")
+                        Log.Error($"No files found matching pattern: {opts.Input}")
                         return 1
                     else
                         printfn $"Found {files.Length} files to process"
                         printfn ""
 
                         // Process all files in parallel with max parallelism limit
-                        let tasks = files |> Array.map (fun f -> debayerImage f outputDir patternOverride suffix overwrite outputFormat)
-                        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = maxParallel)
+                        let tasks = files |> Array.map (fun f ->
+                            debayerImage f opts.Output opts.Pattern opts.Suffix opts.Overwrite opts.OutputFormat opts.Split)
+                        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                         let successCount = results |> Array.filter id |> Array.length
                         let failCount = results.Length - successCount

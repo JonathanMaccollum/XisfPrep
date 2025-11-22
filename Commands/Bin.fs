@@ -23,6 +23,17 @@ let private defaultSuffix factor = $"_bin{factor}x"
 let private defaultParallel = System.Environment.ProcessorCount
 // ---
 
+type BinOptions = {
+    Input: string
+    Output: string
+    Factor: int
+    Method: BinningMethod
+    Suffix: string
+    Overwrite: bool
+    MaxParallel: int
+    OutputFormat: XisfSampleFormat option
+}
+
 let showHelp() =
     printfn "bin - Downsample images by binning pixels together"
     printfn ""
@@ -54,52 +65,59 @@ let showHelp() =
     printfn "  xisfprep bin -i \"lights/*.xisf\" -o \"binned/\" --factor 2"
     printfn "  xisfprep bin -i \"lights/*.xisf\" -o \"preview/\" --factor 4 --method median"
 
-let parseArgs (args: string array) =
-    let rec parse (args: string list) input output factor method suffix overwrite maxParallel outputFormat =
+let parseArgs (args: string array) : BinOptions =
+    // Track suffix separately since it depends on factor
+    let rec parse (args: string list) (opts: BinOptions) (customSuffix: string option) =
         match args with
-        | [] -> (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat)
+        | [] ->
+            // Apply suffix default based on final factor
+            let finalSuffix = customSuffix |> Option.defaultValue (defaultSuffix opts.Factor)
+            { opts with Suffix = finalSuffix }
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output factor method suffix overwrite maxParallel outputFormat
+            parse rest { opts with Input = value } customSuffix
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) factor method suffix overwrite maxParallel outputFormat
+            parse rest { opts with Output = value } customSuffix
         | "--factor" :: value :: rest ->
-            parse rest input output (Some (int value)) method suffix overwrite maxParallel outputFormat
+            parse rest { opts with Factor = int value } customSuffix
         | "--method" :: value :: rest ->
             let m = match value.ToLower() with
                     | "average" -> Average
                     | "median" -> Median
                     | "sum" -> Sum
                     | _ -> failwithf "Unknown binning method: %s" value
-            parse rest input output factor (Some m) suffix overwrite maxParallel outputFormat
+            parse rest { opts with Method = m } customSuffix
         | "--suffix" :: value :: rest ->
-            parse rest input output factor method (Some value) overwrite maxParallel outputFormat
+            parse rest opts (Some value)
         | "--overwrite" :: rest ->
-            parse rest input output factor method suffix true maxParallel outputFormat
+            parse rest { opts with Overwrite = true } customSuffix
         | "--parallel" :: value :: rest ->
-            parse rest input output factor method suffix overwrite (Some (int value)) outputFormat
+            parse rest { opts with MaxParallel = int value } customSuffix
         | "--output-format" :: value :: rest ->
             match PixelIO.parseOutputFormat value with
-            | Some fmt -> parse rest input output factor method suffix overwrite maxParallel (Some fmt)
+            | Some fmt -> parse rest { opts with OutputFormat = Some fmt } customSuffix
             | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
-        | arg :: rest ->
+        | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat) = parse (List.ofArray args) None None None None None false None None
+    let defaults = {
+        Input = ""
+        Output = ""
+        Factor = defaultFactor
+        Method = defaultMethod
+        Suffix = ""  // Will be set based on factor
+        Overwrite = false
+        MaxParallel = defaultParallel
+        OutputFormat = None
+    }
 
-    let input = match input with Some v -> v | None -> failwith "Required argument: --input"
-    let output = match output with Some v -> v | None -> failwith "Required argument: --output"
-    let factor = factor |> Option.defaultValue defaultFactor
-    let method = method |> Option.defaultValue defaultMethod
-    let suffix = suffix |> Option.defaultValue (defaultSuffix factor)
-    let maxParallel = maxParallel |> Option.defaultValue defaultParallel
+    let opts = parse (List.ofArray args) defaults None
 
-    if factor < 2 || factor > 6 then
-        failwith "Binning factor must be between 2 and 6"
+    if String.IsNullOrEmpty opts.Input then failwith "Required argument: --input"
+    if String.IsNullOrEmpty opts.Output then failwith "Required argument: --output"
+    if opts.Factor < 2 || opts.Factor > 6 then failwith "Binning factor must be between 2 and 6"
+    if opts.MaxParallel < 1 then failwith "Parallel count must be at least 1"
 
-    if maxParallel < 1 then
-        failwith "Parallel count must be at least 1"
-
-    (input, output, factor, method, suffix, overwrite, maxParallel, outputFormat)
+    opts
 
 let applyBinningMethod (pixels: float array) (method: BinningMethod) =
     if Array.isEmpty pixels then 0.0
@@ -257,16 +275,16 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputDir, factor, method, suffix, overwrite, maxParallel, outputFormat) = parseArgs args
+                let opts = parseArgs args
 
-                Log.Information($"Binning images with factor {factor} using {method} method")
+                Log.Information($"Binning images with factor {opts.Factor} using {opts.Method} method")
 
-                if not (Directory.Exists(outputDir)) then
-                    Directory.CreateDirectory(outputDir) |> ignore
-                    Log.Information($"Created output directory: {outputDir}")
+                if not (Directory.Exists(opts.Output)) then
+                    Directory.CreateDirectory(opts.Output) |> ignore
+                    Log.Information($"Created output directory: {opts.Output}")
 
-                let inputDir = Path.GetDirectoryName(inputPattern)
-                let pattern = Path.GetFileName(inputPattern)
+                let inputDir = Path.GetDirectoryName(opts.Input)
+                let pattern = Path.GetFileName(opts.Input)
                 let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
 
                 if not (Directory.Exists(actualDir)) then
@@ -276,15 +294,16 @@ let run (args: string array) =
                     let files = Directory.GetFiles(actualDir, pattern)
 
                     if files.Length = 0 then
-                        Log.Error($"No files found matching pattern: {inputPattern}")
+                        Log.Error($"No files found matching pattern: {opts.Input}")
                         return 1
                     else
                         printfn $"Found {files.Length} files to process"
                         printfn ""
 
                         // Process all files in parallel with max parallelism limit
-                        let tasks = files |> Array.map (fun f -> binImage f outputDir factor method suffix overwrite outputFormat)
-                        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = maxParallel)
+                        let tasks = files |> Array.map (fun f ->
+                            binImage f opts.Output opts.Factor opts.Method opts.Suffix opts.Overwrite opts.OutputFormat)
+                        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                         let successCount = results |> Array.filter id |> Array.length
                         let failCount = results.Length - successCount

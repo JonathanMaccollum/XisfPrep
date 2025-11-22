@@ -69,6 +69,20 @@ type AnalysisResult = {
     Error: string option
 }
 
+type StatsOptions = {
+    Input: string
+    Output: string option
+    Metrics: MetricsLevel
+    DetectStars: bool
+    HeaderOnly: bool
+    GroupBy: GroupBy
+    SortBy: SortBy
+    SortOrder: SortOrder
+    MinMedian: float option
+    MaxMad: float option
+    MinSnr: float option
+}
+
 let showHelp() =
     printfn "stats - Calculate and display image statistics with grouping and sorting"
     printfn ""
@@ -109,25 +123,36 @@ let showHelp() =
     printfn "  xisfprep stats -i \"session/*.xisf\" --header-only --group-by target,filter"
     printfn "  xisfprep stats -i \"archive/**/*.xisf\" --header-only -o inventory.csv"
 
-let parseArgs (args: string array) =
-    let rec parse (args: string list) input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr =
+let parseArgs (args: string array) : StatsOptions =
+    // Track sortBy and sortOrder separately for auto-determination
+    let rec parse (args: string list) (opts: StatsOptions) (sortByOpt: SortBy option) (sortOrderOpt: SortOrder option) =
         match args with
-        | [] -> (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
+        | [] ->
+            // Apply defaults and auto-determine sort order
+            let sortBy = sortByOpt |> Option.defaultValue ByName
+            let sortOrder =
+                match sortOrderOpt with
+                | Some order -> order
+                | None ->
+                    match sortBy with
+                    | ByMedian | BySNR | ByStars | ByExposure -> Descending
+                    | ByMAD | ByFWHM | ByName | ByDate -> Ascending
+            { opts with SortBy = sortBy; SortOrder = sortOrder }
         | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parse rest (Some value) output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with Input = value } sortByOpt sortOrderOpt
         | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parse rest input (Some value) metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with Output = Some value } sortByOpt sortOrderOpt
         | "--header-only" :: rest ->
-            parse rest input output metrics detectStars true groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with HeaderOnly = true } sortByOpt sortOrderOpt
         | "--metrics" :: value :: rest ->
             let level = match value.ToLower() with
                         | "basic" -> Basic
                         | "histogram" -> Histogram
                         | "all" -> All
                         | _ -> failwithf "Unknown metrics level: %s" value
-            parse rest input output (Some level) detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with Metrics = level } sortByOpt sortOrderOpt
         | "--detect-stars" :: rest ->
-            parse rest input output metrics true headerOnly groupBy sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with DetectStars = true } sortByOpt sortOrderOpt
         | "--group-by" :: value :: rest ->
             let group = match value.ToLower() with
                         | "target" -> ByTarget
@@ -135,7 +160,7 @@ let parseArgs (args: string array) =
                         | "target,filter" | "targetfilter" -> ByTargetAndFilter
                         | "imagetype" -> ByImageType
                         | _ -> failwithf "Unknown grouping: %s" value
-            parse rest input output metrics detectStars headerOnly (Some group) sortBy sortOrder minMedian maxMad minSnr
+            parse rest { opts with GroupBy = group } sortByOpt sortOrderOpt
         | "--sort-by" :: value :: rest ->
             let sort = match value.ToLower() with
                        | "name" -> ByName
@@ -147,56 +172,54 @@ let parseArgs (args: string array) =
                        | "exposure" -> ByExposure
                        | "date" -> ByDate
                        | _ -> failwithf "Unknown sort metric: %s" value
-            parse rest input output metrics detectStars headerOnly groupBy (Some sort) sortOrder minMedian maxMad minSnr
+            parse rest opts (Some sort) sortOrderOpt
         | "--sort-order" :: value :: rest ->
             let order = match value.ToLower() with
                         | "asc" | "ascending" -> Ascending
                         | "desc" | "descending" -> Descending
                         | _ -> failwithf "Unknown sort order: %s" value
-            parse rest input output metrics detectStars headerOnly groupBy sortBy (Some order) minMedian maxMad minSnr
+            parse rest opts sortByOpt (Some order)
         | "--min-median" :: value :: rest ->
-            let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder (Some threshold) maxMad minSnr
+            parse rest { opts with MinMedian = Some (Double.Parse(value)) } sortByOpt sortOrderOpt
         | "--max-mad" :: value :: rest ->
-            let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian (Some threshold) minSnr
+            parse rest { opts with MaxMad = Some (Double.Parse(value)) } sortByOpt sortOrderOpt
         | "--min-snr" :: value :: rest ->
-            let threshold = Double.Parse(value)
-            parse rest input output metrics detectStars headerOnly groupBy sortBy sortOrder minMedian maxMad (Some threshold)
-        | arg :: rest ->
+            parse rest { opts with MinSnr = Some (Double.Parse(value)) } sortByOpt sortOrderOpt
+        | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
-    let (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) =
-        parse (List.ofArray args) None None None false false None None None None None None
+    let defaults = {
+        Input = ""
+        Output = None
+        Metrics = Basic
+        DetectStars = false
+        HeaderOnly = false
+        GroupBy = NoGrouping
+        SortBy = ByName
+        SortOrder = Ascending
+        MinMedian = None
+        MaxMad = None
+        MinSnr = None
+    }
 
-    // Validate incompatible options
-    if headerOnly && detectStars then
+    let opts = parse (List.ofArray args) defaults None None
+
+    // Validation
+    if String.IsNullOrEmpty opts.Input then failwith "Required argument: --input"
+
+    if opts.HeaderOnly && opts.DetectStars then
         failwith "--header-only and --detect-stars are incompatible (star detection requires pixel data)"
 
-    if headerOnly && (minMedian.IsSome || maxMad.IsSome || minSnr.IsSome) then
+    if opts.HeaderOnly && (opts.MinMedian.IsSome || opts.MaxMad.IsSome || opts.MinSnr.IsSome) then
         failwith "--header-only is incompatible with --min-median, --max-mad, and --min-snr (require pixel statistics)"
 
-    if headerOnly then
-        match sortBy with
-        | Some (ByMedian | BySNR | ByMAD | ByFWHM | ByStars) ->
+    if opts.HeaderOnly then
+        match opts.SortBy with
+        | ByMedian | BySNR | ByMAD | ByFWHM | ByStars ->
             failwith "--header-only is incompatible with --sort-by median/snr/mad/fwhm/stars (require pixel statistics). Use --sort-by name/exposure/date instead."
         | _ -> ()
 
-    let input = match input with Some v -> v | None -> failwith "Required argument: --input"
-    let metrics = metrics |> Option.defaultValue Basic
-    let groupBy = groupBy |> Option.defaultValue NoGrouping
-    let sortBy = sortBy |> Option.defaultValue ByName
-
-    // Auto-determine sort order based on metric if not specified
-    let sortOrder =
-        match sortOrder with
-        | Some order -> order
-        | None ->
-            match sortBy with
-            | ByMedian | BySNR | ByStars | ByExposure -> Descending  // Higher is better
-            | ByMAD | ByFWHM | ByName | ByDate -> Ascending          // Lower is better
-
-    (input, output, metrics, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr)
+    opts
 
 let calculateStats (values: float[]) =
     if Array.isEmpty values then
@@ -994,10 +1017,10 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputPath, metricsLevel, detectStars, headerOnly, groupBy, sortBy, sortOrder, minMedian, maxMad, minSnr) = parseArgs args
+                let opts = parseArgs args
 
-                let inputDir = Path.GetDirectoryName(inputPattern)
-                let pattern = Path.GetFileName(inputPattern)
+                let inputDir = Path.GetDirectoryName(opts.Input)
+                let pattern = Path.GetFileName(opts.Input)
                 let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
 
                 if not (Directory.Exists(actualDir)) then
@@ -1007,21 +1030,21 @@ let run (args: string array) =
                     let files = Directory.GetFiles(actualDir, pattern) |> Array.sort
 
                     if files.Length = 0 then
-                        Log.Error($"No files found matching pattern: {inputPattern}")
+                        Log.Error($"No files found matching pattern: {opts.Input}")
                         return 1
                     else
                         let plural = if files.Length = 1 then "" else "s"
-                        let mode = if headerOnly then "(header-only mode)" else ""
+                        let mode = if opts.HeaderOnly then "(header-only mode)" else ""
                         printfn $"Found {files.Length} file{plural} to analyze {mode}"
 
                         let! results =
-                            if headerOnly then
+                            if opts.HeaderOnly then
                                 files
                                 |> Array.map analyzeImageMetadata
                                 |> Async.Parallel
                             else
                                 files
-                                |> Array.map (fun f -> analyzeImage f metricsLevel detectStars)
+                                |> Array.map (fun f -> analyzeImage f opts.Metrics opts.DetectStars)
                                 |> Async.Parallel
 
                         let allStats = results |> Array.choose (fun r -> r.Stats)
@@ -1032,7 +1055,7 @@ let run (args: string array) =
                             return 1
                         else
                             // Apply filters
-                            let filteredStats = applyFilters allStats minMedian maxMad minSnr
+                            let filteredStats = applyFilters allStats opts.MinMedian opts.MaxMad opts.MinSnr
 
                             if filteredStats.Length = 0 then
                                 Log.Warning("No images passed filtering criteria")
@@ -1043,12 +1066,12 @@ let run (args: string array) =
                                     let filteredPlural = if filtered = 1 then "" else "s"
                                     printfn $"Filtered out {filtered} file{filteredPlural} based on quality thresholds"
 
-                                if headerOnly then
-                                    printStatsHeaderOnly filteredStats groupBy sortBy sortOrder
+                                if opts.HeaderOnly then
+                                    printStatsHeaderOnly filteredStats opts.GroupBy opts.SortBy opts.SortOrder
                                 else
-                                    printStats filteredStats groupBy sortBy sortOrder
+                                    printStats filteredStats opts.GroupBy opts.SortBy opts.SortOrder
 
-                                match outputPath with
+                                match opts.Output with
                                 | Some path ->
                                     writeCsv path filteredStats
                                     printfn ""
