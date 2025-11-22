@@ -4,6 +4,7 @@ open System
 open System.IO
 open Serilog
 open XisfLib.Core
+open Algorithms.Statistics
 
 // --- Type Definitions ---
 
@@ -35,6 +36,14 @@ type IntegrationSettings = {
     Rejection: RejectionMethod
     RejectionNormalization: RejectionNormalization
     Iterations: int
+}
+
+type InlineCalibrationConfig = {
+    BiasFrame: string option
+    BiasLevel: float option
+    DarkFrame: string option
+    UncalibratedDark: bool
+    Pedestal: int
 }
 
 // --- Defaults ---
@@ -84,6 +93,13 @@ let showHelp() =
     printfn "  --output-format <format>  Output sample format (default: float32 for stacking precision)"
     printfn "                              uint8, uint16, uint32, float32, float64"
     printfn ""
+    printfn "Inline Calibration (for master dark/flat creation):"
+    printfn "  --bias, -b <file>         Master bias frame for inline calibration"
+    printfn "  --bias-level <value>      Constant bias value (alternative to --bias)"
+    printfn "  --dark, -d <file>         Master dark frame for inline calibration"
+    printfn "  --uncalibrated-dark       Dark is raw (not bias-subtracted)"
+    printfn "  --pedestal <value>        Pedestal added after calibration [0-65535] (default: 0)"
+    printfn ""
     printfn "Process:"
     printfn "  1. Load all input images into memory"
     printfn "  2. Calculate per-channel statistics for normalization"
@@ -118,6 +134,12 @@ type private ParseState = {
     Iterations: int option
     Overwrite: bool
     OutputFormat: XisfSampleFormat option
+    // Inline calibration
+    BiasFrame: string option
+    BiasLevel: float option
+    DarkFrame: string option
+    UncalibratedDark: bool
+    Pedestal: int option
 }
 
 let parseArgs (args: string array) =
@@ -135,6 +157,12 @@ let parseArgs (args: string array) =
         Iterations = None
         Overwrite = false
         OutputFormat = None
+        // Inline calibration
+        BiasFrame = None
+        BiasLevel = None
+        DarkFrame = None
+        UncalibratedDark = false
+        Pedestal = None
     }
 
     let rec parse (state: ParseState) (args: string list) =
@@ -168,6 +196,20 @@ let parseArgs (args: string array) =
             if iterations < 1 then
                 failwith "Iterations must be at least 1"
 
+            // Inline calibration validation
+            if state.BiasFrame.IsSome && state.BiasLevel.IsSome then
+                failwith "--bias and --bias-level are mutually exclusive"
+
+            if state.UncalibratedDark && state.DarkFrame.IsNone then
+                failwith "--uncalibrated-dark requires --dark"
+
+            if state.UncalibratedDark && state.BiasFrame.IsNone && state.BiasLevel.IsNone then
+                failwith "--uncalibrated-dark requires --bias or --bias-level"
+
+            let pedestal = state.Pedestal |> Option.defaultValue 0
+            if pedestal < 0 || pedestal > 65535 then
+                failwith "Pedestal must be in range [0, 65535]"
+
             // Build the final settings record
             let settings = {
                 Combination = combination
@@ -177,8 +219,21 @@ let parseArgs (args: string array) =
                 Iterations = iterations
             }
 
-            // Return the 5-tuple that the 'run' function expects
-            (input, output, settings, state.Overwrite, state.OutputFormat)
+            // Build inline calibration config
+            let inlineCalibration =
+                if state.BiasFrame.IsSome || state.BiasLevel.IsSome || state.DarkFrame.IsSome || pedestal > 0 then
+                    Some {
+                        BiasFrame = state.BiasFrame
+                        BiasLevel = state.BiasLevel
+                        DarkFrame = state.DarkFrame
+                        UncalibratedDark = state.UncalibratedDark
+                        Pedestal = pedestal
+                    }
+                else
+                    None
+
+            // Return the 6-tuple that the 'run' function expects
+            (input, output, settings, state.Overwrite, state.OutputFormat, inlineCalibration)
 
         // Recursive calls are now clean and unambiguous
         | "--input" :: value :: rest | "-i" :: value :: rest ->
@@ -231,7 +286,18 @@ let parseArgs (args: string array) =
             match PixelIO.parseOutputFormat value with
             | Some fmt -> parse { state with OutputFormat = Some fmt } rest
             | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
-        | arg :: rest ->
+        // Inline calibration
+        | "--bias" :: value :: rest | "-b" :: value :: rest ->
+            parse { state with BiasFrame = Some value } rest
+        | "--bias-level" :: value :: rest ->
+            parse { state with BiasLevel = Some (float value) } rest
+        | "--dark" :: value :: rest | "-d" :: value :: rest ->
+            parse { state with DarkFrame = Some value } rest
+        | "--uncalibrated-dark" :: rest ->
+            parse { state with UncalibratedDark = true } rest
+        | "--pedestal" :: value :: rest ->
+            parse { state with Pedestal = Some (int value) } rest
+        | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
     // The initial call is now simple and type-safe
@@ -322,6 +388,110 @@ module LinearFit =
 
             let survivingSet = surviving |> Array.map fst |> Set.ofArray
             Array.init n (fun i -> survivingSet.Contains i)
+
+// --- Inline Calibration Module ---
+module InlineCalibration =
+    type LoadedMasters = {
+        BiasData: float[] option
+        DarkData: float[] option
+        Width: int
+        Height: int
+        Channels: int
+    }
+
+    let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
+        async {
+            let reader = new XisfReader()
+            let! metadata = reader.ReadAsync(path) |> Async.AwaitTask
+
+            if metadata.Images.Count = 0 then
+                failwithf "No images found in file: %s" path
+
+            let img = metadata.Images.[0]
+            let width = int img.Geometry.Width
+            let height = int img.Geometry.Height
+            let channels = int img.Geometry.ChannelCount
+            let floatData = PixelIO.readPixelsAsFloat img
+
+            return (floatData, width, height, channels)
+        }
+
+    let loadMasters (config: InlineCalibrationConfig) : Async<LoadedMasters option> =
+        async {
+            let mutable width = 0
+            let mutable height = 0
+            let mutable channels = 0
+            let mutable biasData = None
+            let mutable darkData = None
+
+            // Load bias frame
+            match config.BiasFrame with
+            | Some path ->
+                Log.Information("Loading master bias for inline calibration: {Path}", path)
+                let! (data, w, h, c) = loadFrameAsFloat path
+                width <- w
+                height <- h
+                channels <- c
+                biasData <- Some data
+            | None -> ()
+
+            // Load dark frame
+            match config.DarkFrame with
+            | Some path ->
+                Log.Information("Loading master dark for inline calibration: {Path}", path)
+                let! (data, w, h, c) = loadFrameAsFloat path
+                if width > 0 && (w <> width || h <> height || c <> channels) then
+                    failwithf "Dark dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
+                width <- w
+                height <- h
+                channels <- c
+                darkData <- Some data
+            | None -> ()
+
+            if biasData.IsNone && darkData.IsNone && config.BiasLevel.IsNone && config.Pedestal = 0 then
+                return None
+            else
+                return Some {
+                    BiasData = biasData
+                    DarkData = darkData
+                    Width = width
+                    Height = height
+                    Channels = channels
+                }
+        }
+
+    let calibratePixels (pixels: float[]) (masters: LoadedMasters) (config: InlineCalibrationConfig) : float[] =
+        let result = Array.zeroCreate pixels.Length
+
+        for i = 0 to pixels.Length - 1 do
+            let lightValue = pixels.[i]
+
+            // Get bias value
+            let biasValue =
+                match masters.BiasData, config.BiasLevel with
+                | Some data, _ -> data.[i]
+                | None, Some level -> level
+                | None, None -> 0.0
+
+            let afterBias = lightValue - biasValue
+
+            // Apply dark subtraction
+            let afterDark =
+                match masters.DarkData with
+                | Some darkData ->
+                    let darkValue = darkData.[i]
+                    if config.UncalibratedDark then
+                        // Dark contains bias, subtract it
+                        afterBias - (darkValue - biasValue)
+                    else
+                        afterBias - darkValue
+                | None -> afterBias
+
+            // Add pedestal and clamp
+            let final = afterDark + float config.Pedestal
+            result.[i] <- max 0.0 (min 65535.0 final)
+
+        result
 
 // --- Main Integration Logic ---
 
@@ -480,7 +650,7 @@ let run (args: string array) =
     else
         let computation = async {
             try
-                let (inputPattern, outputPath, settings, overwrite, outputFormatOverride) = parseArgs args
+                let (inputPattern, outputPath, settings, overwrite, outputFormatOverride, inlineCalConfig) = parseArgs args
 
                 // Check if output exists
                 if File.Exists(outputPath) && not overwrite then
@@ -492,6 +662,12 @@ let run (args: string array) =
                     Log.Information($"Overwriting existing file '{Path.GetFileName outputPath}'")
 
                 Log.Information("Starting image integration")
+
+                // Load inline calibration masters if configured
+                let! inlineMasters =
+                    match inlineCalConfig with
+                    | Some config -> InlineCalibration.loadMasters config
+                    | None -> async { return None }
 
                 // Find input files
                 let inputDir = Path.GetDirectoryName(inputPattern)
@@ -547,7 +723,22 @@ let run (args: string array) =
                 printfn $"Combination: {settings.Combination}"
 
                 // Get pixel data using PixelIO (handles all sample formats)
-                let pixelArrays = images |> Array.map PixelIO.readPixelsAsFloat
+                // Apply inline calibration if configured
+                let pixelArrays =
+                    match inlineMasters, inlineCalConfig with
+                    | Some masters, Some config ->
+                        printfn "Applying inline calibration to input images..."
+                        // Validate dimensions match
+                        if masters.Width > 0 && (masters.Width <> width || masters.Height <> height || masters.Channels <> channels) then
+                            failwithf "Master frame dimension mismatch: Expected %dx%dx%d, got %dx%dx%d"
+                                width height channels masters.Width masters.Height masters.Channels
+                        images
+                        |> Array.Parallel.map (fun img ->
+                            let rawPixels = PixelIO.readPixelsAsFloat img
+                            InlineCalibration.calibratePixels rawPixels masters config
+                        )
+                    | _ ->
+                        images |> Array.map PixelIO.readPixelsAsFloat
 
                 // Calculate stats if normalization needed
                 let (imageStats, referenceStats) =
