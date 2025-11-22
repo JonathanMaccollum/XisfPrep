@@ -493,6 +493,105 @@ module InlineCalibration =
 
         result
 
+// --- Header Analysis Module ---
+module HeaderAnalysis =
+    type HeaderCategory =
+        | Identical of XisfFitsKeyword
+        | Varying of name: string * values: string[]
+        | Skip // HISTORY, COMMENT, etc.
+
+    let private getFitsKeywords (img: XisfImage) =
+        if isNull img.AssociatedElements then [||]
+        else
+            img.AssociatedElements :> seq<_>
+            |> Seq.toArray
+            |> Array.choose (fun e ->
+                match e with
+                | :? XisfFitsKeyword as kw -> Some kw
+                | _ -> None)
+
+    let analyzeHeaders (images: XisfImage[]) =
+        // Collect all FITS keywords from all images
+        let allKeywordSets = images |> Array.map getFitsKeywords
+
+        // Get union of all keyword names (excluding HISTORY, COMMENT)
+        let allNames =
+            allKeywordSets
+            |> Array.collect (Array.map (fun kw -> kw.Name))
+            |> Array.distinct
+            |> Array.filter (fun name ->
+                name <> "HISTORY" && name <> "COMMENT" &&
+                name <> "SIMPLE" && name <> "BITPIX" &&
+                name <> "NAXIS" && name <> "NAXIS1" && name <> "NAXIS2" &&
+                name <> "EXTEND" && name <> "BZERO" && name <> "BSCALE")
+
+        // For each keyword name, collect values from all images
+        allNames
+        |> Array.map (fun name ->
+            let values =
+                allKeywordSets
+                |> Array.map (fun keywords ->
+                    keywords
+                    |> Array.tryFind (fun kw -> kw.Name = name)
+                    |> Option.map (fun kw -> kw.Value)
+                    |> Option.defaultValue "")
+
+            // Check if all non-empty values are identical
+            let nonEmptyValues = values |> Array.filter (fun v -> v <> "")
+            if nonEmptyValues.Length = 0 then
+                Skip
+            elif nonEmptyValues |> Array.distinct |> Array.length = 1 then
+                // All identical - find keyword from any image that has it (preserves comment)
+                let kw =
+                    allKeywordSets
+                    |> Array.tryPick (fun keywords ->
+                        keywords |> Array.tryFind (fun kw -> kw.Name = name))
+                match kw with
+                | Some k -> Identical k
+                | None -> Skip
+            else
+                // Values vary - store as CSV
+                Varying (name, values))
+        |> Array.filter (fun cat ->
+            match cat with
+            | Skip -> false
+            | _ -> true)
+
+    let buildInputFileProperties (filenames: string[]) =
+        filenames
+        |> Array.mapi (fun i name ->
+            let id = sprintf "Integration:InputFiles:%05d" i
+            XisfStringProperty(id, name, "") :> XisfProperty)
+
+    let buildVaryingValueProperties (categories: HeaderCategory[]) =
+        categories
+        |> Array.choose (fun cat ->
+            match cat with
+            | Varying (name, values) ->
+                let id = sprintf "Integration:SourceValues:%s" name
+                let csv = String.concat "," values
+                Some (XisfStringProperty(id, csv, sprintf "Values for %s across input files" name) :> XisfProperty)
+            | _ -> None)
+
+    let buildIdenticalFitsKeywords (categories: HeaderCategory[]) =
+        categories
+        |> Array.choose (fun cat ->
+            match cat with
+            | Identical kw -> Some (kw :> XisfCoreElement)
+            | _ -> None)
+
+    let calculateTotalExposure (images: XisfImage[]) =
+        images
+        |> Array.sumBy (fun img ->
+            let fits = getFitsKeywords img
+            fits
+            |> Array.tryFind (fun kw -> kw.Name = "EXPTIME" || kw.Name = "EXPOSURE")
+            |> Option.bind (fun kw ->
+                match Double.TryParse(kw.Value) with
+                | true, v -> Some v
+                | false, _ -> None)
+            |> Option.defaultValue 0.0)
+
 // --- Main Integration Logic ---
 
 let validateImages (images: XisfImage[]) =
@@ -802,22 +901,36 @@ let run (args: string array) =
                 let normString = sprintf "%A" settings.Normalization
                 let rejectString = sprintf "%A" settings.Rejection
 
+                // Get filenames for input file list
+                let filenames = files |> Array.map Path.GetFileName
+
+                // Analyze headers across all input images
+                let headerCategories = HeaderAnalysis.analyzeHeaders images
+                let totalExposure = HeaderAnalysis.calculateTotalExposure images
+
+                // Build input file list properties
+                let inputFileProps = HeaderAnalysis.buildInputFileProperties filenames
+
+                // Build varying value properties (CSV format)
+                let varyingProps = HeaderAnalysis.buildVaryingValueProperties headerCategories
+
+                // Build summary/integration properties
+                let integrationProps = [|
+                    XisfScalarProperty<int>("Integration:NumberOfImages", images.Length, "Number of integrated frames") :> XisfProperty
+                    XisfScalarProperty<float>("Integration:TotalExposureSeconds", totalExposure, "Total integration time in seconds") :> XisfProperty
+                    XisfStringProperty("Integration:PixelCombination", combString, "Pixel combination method") :> XisfProperty
+                    XisfStringProperty("Integration:PixelRejection", rejectString, "Pixel rejection algorithm") :> XisfProperty
+                    XisfStringProperty("Integration:OutputNormalization", normString, "Image normalization method") :> XisfProperty
+                |]
+
+                // Copy forward original XISF properties from first image
                 let firstProps =
                     if isNull firstImg.Properties then [||]
                     else firstImg.Properties :> seq<_> |> Seq.toArray
 
                 let findProp id = firstProps |> Array.tryFind (fun p -> p.Id = id)
 
-                let firstFits =
-                    if isNull firstImg.AssociatedElements then [||]
-                    else
-                        firstImg.AssociatedElements :> seq<_>
-                        |> Seq.toArray
-                        |> Array.choose (fun e -> if e :? XisfFitsKeyword then Some (e :?> XisfFitsKeyword) else None)
-
-                let findFits name = firstFits |> Array.tryFind (fun f -> f.Name = name)
-
-                let outputProps =
+                let preservedProps =
                     [
                         findProp "Instrument:Camera:Name"
                         findProp "Instrument:Camera:Gain"
@@ -825,47 +938,45 @@ let run (args: string array) =
                         findProp "Instrument:Camera:YBinning"
                         findProp "Instrument:Sensor:XPixelSize"
                         findProp "Instrument:Sensor:YPixelSize"
-
-                        Some (XisfScalarProperty<int>("ImageIntegration:NumberOfImages", images.Length, "Number of integrated frames") :> XisfProperty)
-                        Some (XisfStringProperty("ImageIntegration:PixelCombination", combString, "Pixel combination method") :> XisfProperty)
-                        Some (XisfStringProperty("ImageIntegration:PixelRejection", rejectString, "Pixel rejection algorithm") :> XisfProperty)
-                        Some (XisfStringProperty("ImageIntegration:OutputNormalization", normString, "Image normalization method") :> XisfProperty)
                     ]
                     |> List.choose id
                     |> Array.ofList
 
+                // Combine all properties
+                let outputProps =
+                    Array.concat [preservedProps; integrationProps; inputFileProps; varyingProps]
+
+                // Build identical FITS keywords from analysis
+                let identicalFits = HeaderAnalysis.buildIdenticalFitsKeywords headerCategories
+
+                // Build calibration provenance HISTORY entries
+                let calibrationHistory =
+                    match inlineCalConfig with
+                    | Some config ->
+                        [|
+                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.masterBias: %s"
+                                (config.BiasFrame |> Option.map Path.GetFileName |> Option.defaultValue "(none)")) :> XisfCoreElement
+                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.biasLevel: %s"
+                                (config.BiasLevel |> Option.map string |> Option.defaultValue "(none)")) :> XisfCoreElement
+                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.masterDark: %s"
+                                (config.DarkFrame |> Option.map Path.GetFileName |> Option.defaultValue "(none)")) :> XisfCoreElement
+                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.pedestal: %d" config.Pedestal) :> XisfCoreElement
+                        |]
+                    | None -> [||]
+
+                // Build integration HISTORY entries
+                let integrationHistory = [|
+                    XisfFitsKeyword("HISTORY", "", "Integration with XisfPrep v1.0") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", $"ImageIntegration.pixelCombination: {combString}") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", $"ImageIntegration.outputNormalization: {normString}") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", $"ImageIntegration.pixelRejection: {rejectString}") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", $"ImageIntegration.numberOfImages: {images.Length}") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", $"ImageIntegration.totalExposureSeconds: {totalExposure:F2}") :> XisfCoreElement
+                |]
+
+                // Combine all FITS keywords
                 let outputFits =
-                    [
-                        findFits "INSTRUME" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "EGAIN" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "XBINNING" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "YBINNING" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "XPIXSZ" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "YPIXSZ" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "BAYERPAT" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "XBAYROFF" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "YBAYROFF" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "TELESCOP" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "FOCALLEN" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "APTDIA" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "EQUINOX" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "OBSGEO-L" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "OBSGEO-B" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "LONG-OBS" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "LAT-OBS" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "DATE-OBS" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "DATE-END" |> Option.map (fun f -> f :> XisfCoreElement)
-                        findFits "IMAGETYP" |> Option.map (fun f -> f :> XisfCoreElement)
-
-                        Some (XisfFitsKeyword("HISTORY", "", "Integration with XisfPrep v1.0") :> XisfCoreElement)
-                        Some (XisfFitsKeyword("HISTORY", "", $"ImageIntegration.pixelCombination: {combString}") :> XisfCoreElement)
-                        Some (XisfFitsKeyword("HISTORY", "", $"ImageIntegration.outputNormalization: {normString}") :> XisfCoreElement)
-                        Some (XisfFitsKeyword("HISTORY", "", $"ImageIntegration.pixelRejection: {rejectString}") :> XisfCoreElement)
-                        Some (XisfFitsKeyword("HISTORY", "", $"ImageIntegration.numberOfImages: {images.Length}") :> XisfCoreElement)
-                        Some (XisfFitsKeyword("HISTORY", "", $"ImageIntegration.totalPixels: {pixelCount * images.Length}") :> XisfCoreElement)
-                    ]
-                    |> List.choose id
-                    |> Array.ofList
+                    Array.concat [identicalFits; calibrationHistory; integrationHistory]
 
                 // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
                 let bounds =
