@@ -28,6 +28,7 @@ let showUsage() =
     printfn "  stats       Calculate image statistics"
     printfn "  convert     Format conversion and export"
     printfn "  bin         Downsample images by binning pixels"
+    printfn "  inspect     Diagnostic inspection of XISF file structure"
     printfn ""
     printfn "Global options:"
     printfn "  --verbose, -v    Enable verbose diagnostic output"
@@ -46,6 +47,7 @@ let commandHandlers =
         "stats", Commands.Stats.run
         "convert", Commands.Convert.run
         "bin", Commands.Bin.run
+        "inspect", Commands.Inspect.run
     ]
 
 [<EntryPoint>]

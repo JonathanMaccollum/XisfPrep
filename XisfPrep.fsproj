@@ -17,6 +17,7 @@
     <Compile Include="Commands\Stats.fs" />
     <Compile Include="Commands\Convert.fs" />
     <Compile Include="Commands\Bin.fs" />
+    <Compile Include="Commands\Inspect.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
