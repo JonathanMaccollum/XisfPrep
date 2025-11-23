@@ -5,6 +5,7 @@ open System.IO
 open Serilog
 open XisfLib.Core
 open Algorithms.Statistics
+open Algorithms
 
 type MetricsLevel =
     | Basic

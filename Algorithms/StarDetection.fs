@@ -1,4 +1,4 @@
-module Commands.StarDetection
+module Algorithms.StarDetection
 
 open System
 
