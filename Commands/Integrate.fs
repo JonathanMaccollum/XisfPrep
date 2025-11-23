@@ -328,66 +328,86 @@ module Stats =
 
 // --- Linear Fit Module ---
 module LinearFit =
-    let fitLine (points: (float * float)[]) : float * float * float[] =
-        if Array.isEmpty points then (0.0, 0.0, [||])
+    type FitResult =
+        | Success of slope: float * intercept: float * residuals: float[]
+        | Undefined
+
+    let fitLine (points: (float * float)[]) : FitResult =
+        if points.Length < 2 then Undefined
         else
             let n = float points.Length
-            let sumX = points |> Array.sumBy fst
-            let sumY = points |> Array.sumBy snd
-            let sumXY = points |> Array.sumBy (fun (x, y) -> x * y)
-            let sumXX = points |> Array.sumBy (fun (x, _) -> x * x)
 
-            let slope =
-                let denominator = n * sumXX - sumX * sumX
-                if abs denominator < 1e-10 then 0.0
-                else (n * sumXY - sumX * sumY) / denominator
-
-            let intercept = (sumY - slope * sumX) / n
-
-            let residuals =
+            let sumX, sumY =
                 points
-                |> Array.map (fun (x, y) -> y - (slope * x + intercept))
+                |> Array.fold (fun (sx, sy) (x, y) -> sx + x, sy + y) (0.0, 0.0)
 
-            (slope, intercept, residuals)
+            let meanX = sumX / n
+            let meanY = sumY / n
 
-    let rejectOutliers (values: float[]) (lowSigma: float) (highSigma: float) (iterations: int) : bool[] =
-        let n = values.Length
+            // Numerical stability: use centered variables
+            let numerator, denominator =
+                points
+                |> Array.fold (fun (num, den) (x, y) ->
+                    let dx = x - meanX
+                    let dy = y - meanY
+                    (num + dx * dy, den + dx * dx)
+                ) (0.0, 0.0)
 
+            if abs denominator < 1e-10 then
+                Undefined
+            else
+                let slope = numerator / denominator
+                let intercept = meanY - slope * meanX
+
+                let residuals =
+                    points
+                    |> Array.map (fun (x, y) -> y - (slope * x + intercept))
+
+                Success (slope, intercept, residuals)
+
+    let rejectOutliers (points: (float * float)[]) (lowSigma: float) (highSigma: float) (maxIterations: int) : bool[] =
+        let n = points.Length
         if n = 0 then [||]
         else
-            let indexedValues = Array.mapi (fun i v -> (i, v)) values
+            let indexedPoints = points |> Array.mapi (fun i p -> (i, p))
 
-            let rec iterate (currentPoints: (int * float)[]) (iter: int) =
-                if iter >= iterations || Array.isEmpty currentPoints then
-                    currentPoints
+            let rec iterate (currentSet: (int * (float * float))[]) (iter: int) =
+                if iter >= maxIterations || currentSet.Length < 2 then
+                    currentSet
                 else
-                    let fitData = currentPoints |> Array.map (fun (i, v) -> (float i, v))
-                    let (slope, intercept, residuals) = fitLine fitData
+                    let fitData = currentSet |> Array.map snd
 
-                    let (meanRes, _, stdDevRes) = Stats.calculate residuals
+                    match fitLine fitData with
+                    | Undefined -> currentSet
+                    | Success (_, _, residuals) ->
+                        let meanRes = Array.average residuals
+                        let stdDevRes =
+                            let variance =
+                                residuals
+                                |> Array.averageBy (fun r -> pown (r - meanRes) 2)
+                            sqrt variance
 
-                    if stdDevRes = 0.0 then
-                        currentPoints
-                    else
-                        let lowThreshold = meanRes - lowSigma * stdDevRes
-                        let highThreshold = meanRes + highSigma * stdDevRes
-
-                        let nextPoints =
-                            Array.zip currentPoints residuals
-                            |> Array.choose (fun ((idx, value), res) ->
-                                if res >= lowThreshold && res <= highThreshold
-                                then Some (idx, value)
-                                else None)
-
-                        if nextPoints.Length < currentPoints.Length then
-                            iterate nextPoints (iter + 1)
+                        if stdDevRes < 1e-10 then currentSet
                         else
-                            currentPoints
+                            let lowThreshold = meanRes - (lowSigma * stdDevRes)
+                            let highThreshold = meanRes + (highSigma * stdDevRes)
 
-            let surviving = iterate indexedValues iterations
+                            let nextSet =
+                                Array.zip currentSet residuals
+                                |> Array.choose (fun (pt, res) ->
+                                    if res >= lowThreshold && res <= highThreshold then Some pt
+                                    else None
+                                )
 
-            let survivingSet = surviving |> Array.map fst |> Set.ofArray
-            Array.init n (fun i -> survivingSet.Contains i)
+                            if nextSet.Length < currentSet.Length then
+                                iterate nextSet (iter + 1)
+                            else
+                                currentSet
+
+            let surviving = iterate indexedPoints 0
+
+            let survivingIndices = surviving |> Array.map fst |> Set.ofArray
+            Array.init n (fun i -> survivingIndices.Contains i)
 
 // --- Inline Calibration Module ---
 module InlineCalibration =
@@ -560,7 +580,7 @@ module HeaderAnalysis =
     let buildInputFileProperties (filenames: string[]) =
         filenames
         |> Array.mapi (fun i name ->
-            let id = sprintf "Integration:InputFiles:%05d" i
+            let id = sprintf "Integration:InputFiles:F%05d" i  // Must start with letter per XISF spec
             XisfStringProperty(id, name, "") :> XisfProperty)
 
     let buildVaryingValueProperties (categories: HeaderCategory[]) =
@@ -568,7 +588,9 @@ module HeaderAnalysis =
         |> Array.choose (fun cat ->
             match cat with
             | Varying (name, values) ->
-                let id = sprintf "Integration:SourceValues:%s" name
+                // Replace hyphens with underscores for valid XISF property ID
+                let safeName = name.Replace("-", "_")
+                let id = sprintf "Integration:SourceValues:%s" safeName
                 let csv = String.concat "," values
                 Some (XisfStringProperty(id, csv, sprintf "Values for %s across input files" name) :> XisfProperty)
             | _ -> None)
@@ -717,7 +739,8 @@ let processPixel
                 currentPixels
 
             | LinearFitClipping (lowSigma, highSigma) ->
-                let keepMask = LinearFit.rejectOutliers rawPixelValues lowSigma highSigma iterations
+                let points = rawPixelValues |> Array.mapi (fun i v -> (float i, v))
+                let keepMask = LinearFit.rejectOutliers points lowSigma highSigma iterations
                 rawPixelValues
                 |> Array.mapi (fun i v -> (i, v))
                 |> Array.filter (fun (i, _) -> keepMask.[i])
@@ -769,16 +792,28 @@ let run (args: string array) =
                     | None -> async { return None }
 
                 // Find input files
-                let inputDir = Path.GetDirectoryName(inputPattern)
-                let pattern = Path.GetFileName(inputPattern)
-                let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
+                let files =
+                    if inputPattern.StartsWith("@") then
+                        // Read file list from text file
+                        let listPath = inputPattern.Substring(1)
+                        if not (File.Exists(listPath)) then
+                            Log.Error($"File list not found: {listPath}")
+                            [||]
+                        else
+                            File.ReadAllLines(listPath)
+                            |> Array.filter (fun line -> not (String.IsNullOrWhiteSpace(line)))
+                            |> Array.sort
+                    else
+                        // Use glob pattern
+                        let inputDir = Path.GetDirectoryName(inputPattern)
+                        let pattern = Path.GetFileName(inputPattern)
+                        let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
 
-                if not (Directory.Exists(actualDir)) then
-                    Log.Error($"Input directory not found: {actualDir}")
-                    return 1
-                else
-
-                let files = Directory.GetFiles(actualDir, pattern) |> Array.sort
+                        if not (Directory.Exists(actualDir)) then
+                            Log.Error($"Input directory not found: {actualDir}")
+                            [||]
+                        else
+                            Directory.GetFiles(actualDir, pattern) |> Array.sort
 
                 if files.Length = 0 then
                     Log.Error($"No files found matching pattern: {inputPattern}")
