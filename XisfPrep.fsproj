@@ -9,6 +9,7 @@
     <Compile Include="PixelIO.fs" />
     <Compile Include="Algorithms\Statistics.fs" />
     <Compile Include="Algorithms\Painting.fs" />
+    <Compile Include="Algorithms\OutputImage.fs" />
     <Compile Include="Algorithms\StarDetection.fs" />
     <Compile Include="Commands\Calibrate.fs" />
     <Compile Include="Commands\Debayer.fs" />

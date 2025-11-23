@@ -7,6 +7,7 @@ open XisfLib.Core
 open Algorithms
 open Algorithms.Statistics
 open Algorithms.Painting
+open Algorithms.OutputImage
 
 type MarkerType =
     | Circle
@@ -31,81 +32,6 @@ let private defaultIntensity = 1.0
 let private defaultSuffix = "_stars"
 let private defaultParallel = System.Environment.ProcessorCount
 // ---
-
-// --- Image Creation Functions ---
-
-/// Create output image preserving source geometry and headers, with additional headers
-/// Replaces IMAGETYP and SWCREATE in-place to maintain header ordering
-let createOutputImage (source: XisfImage) (pixelData: byte[]) (outputFormat: XisfSampleFormat) (additionalHeaders: XisfCoreElement[]) : XisfImage =
-    let dataBlock = InlineDataBlock(ReadOnlyMemory(pixelData), XisfEncoding.Base64)
-
-    let bounds =
-        match PixelIO.getBoundsForFormat outputFormat with
-        | Some b -> b
-        | None -> Unchecked.defaultof<XisfImageBounds>
-
-    // Build map of headers to replace in-place
-    let replacements =
-        additionalHeaders
-        |> Array.choose (fun elem ->
-            match elem with
-            | :? XisfFitsKeyword as kw -> Some (kw.Name, elem)
-            | _ -> None)
-        |> Map.ofArray
-
-    // Headers we'll replace in-place (not append)
-    let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
-
-    // Process existing headers, replacing in-place where needed
-    let combinedHeaders =
-        if isNull source.AssociatedElements then
-            additionalHeaders
-        else
-            let existing = source.AssociatedElements :> seq<_> |> Seq.toArray
-
-            // Replace headers in-place
-            let updated =
-                existing
-                |> Array.map (fun elem ->
-                    match elem with
-                    | :? XisfFitsKeyword as kw when Map.containsKey kw.Name replacements ->
-                        replacements.[kw.Name]
-                    | _ -> elem)
-
-            // Append headers that weren't replaced in-place
-            let toAppend =
-                additionalHeaders
-                |> Array.filter (fun elem ->
-                    match elem with
-                    | :? XisfFitsKeyword as kw -> not (inPlaceKeys.Contains kw.Name)
-                    | _ -> true)
-
-            Array.append updated toAppend
-
-    XisfImage(
-        source.Geometry,
-        outputFormat,
-        source.ColorSpace,
-        dataBlock,
-        bounds,
-        source.PixelStorage,
-        source.ImageType,
-        source.Offset,
-        source.Orientation,
-        source.ImageId,
-        source.Uuid,
-        source.Properties,
-        combinedHeaders
-    )
-
-/// Write image to disk
-let writeOutputFile (outputPath: string) (image: XisfImage) : Async<unit> =
-    async {
-        let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Stars v1.0")
-        let outUnit = XisfFactory.CreateMonolithic(metadata, image)
-        let writer = new XisfWriter()
-        do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask
-    }
 
 // --- Star Detection Functions ---
 
@@ -449,10 +375,11 @@ let processImage (inputPath: string) (outputDir: string) (opts: StarsOptions) : 
             paintAllStars pixels width height channels outputFormat results opts.Marker opts.ScaleBy opts.Intensity
 
             // Create output image with headers
-            let outputImage = createOutputImage img pixels outputFormat starHeaders
+            let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
+            let outputImage = createOutputImage img pixels outputFormat starHeaders inPlaceKeys
 
             // Write output
-            do! writeOutputFile outPath outputImage
+            do! writeOutputFile outPath outputImage "XisfPrep Stars v1.0"
 
             let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
             printfn $"  {count} stars -> {outFileName} ({width}x{height}, {channels}ch, {sizeMB}MB)"

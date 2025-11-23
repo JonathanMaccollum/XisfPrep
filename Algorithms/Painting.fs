@@ -1,6 +1,7 @@
 module Algorithms.Painting
 
 open System
+open Serilog
 open XisfLib.Core
 
 /// Create black pixel data for given dimensions and format
@@ -38,7 +39,8 @@ let setPixel (pixels: byte[]) (index: int) (value: float) (format: XisfSampleFor
     | XisfSampleFormat.Float64 ->
         let bytes = BitConverter.GetBytes(value)
         for i in 0..7 do pixels.[index * 8 + i] <- bytes.[i]
-    | _ -> ()
+    | fmt ->
+        Log.Warning($"setPixel: Unsupported sample format {fmt}")
 
 /// Paint a circle marker
 let paintCircle (pixels: byte[]) (width: int) (height: int) (channels: int) (channel: int) (cx: float) (cy: float) (radius: float) (intensity: float) (format: XisfSampleFormat) =

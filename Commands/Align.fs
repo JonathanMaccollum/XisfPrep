@@ -6,6 +6,8 @@ open Serilog
 open XisfLib.Core
 open Algorithms
 open Algorithms.Painting
+open Algorithms.Statistics
+open Algorithms.OutputImage
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
@@ -261,6 +263,7 @@ let runDiagnostic
     (fileName: string)
     (ratioTolerance: float)
     (maxStarsForTriangles: int)
+    (minVotes: int)
     : AlignmentDiagnostics =
 
     let targetTriangles = formTriangles targetStars maxStarsForTriangles
@@ -276,7 +279,7 @@ let runDiagnostic
         if sortedVotes.Length > 0 then snd sortedVotes.[0]
         else 0
 
-    let transform = estimateTransform refStars targetStars sortedVotes 3
+    let transform = estimateTransform refStars targetStars sortedVotes minVotes
 
     let matchPercentage =
         if refTriangles.Length > 0 then
@@ -293,24 +296,18 @@ let runDiagnostic
         EstimatedTransform = transform
     }
 
-/// Calculate MAD for star detection threshold
-let calculateMAD (values: float[]) =
+// --- Helper Functions ---
+
+/// Calculate median and MAD for an array
+let private calculateChannelMAD (values: float[]) =
     if values.Length = 0 then 0.0
     else
-        let sorted = Array.copy values
-        Array.sortInPlace sorted
+        let sorted = Array.sort values
         let mid = sorted.Length / 2
         let median =
             if sorted.Length % 2 = 0 then (sorted.[mid - 1] + sorted.[mid]) / 2.0
             else sorted.[mid]
-
-        let deviations = values |> Array.map (fun v -> abs (v - median))
-        Array.sortInPlace deviations
-        let madMid = deviations.Length / 2
-        if deviations.Length % 2 = 0 then
-            (deviations.[madMid - 1] + deviations.[madMid]) / 2.0
-        else
-            deviations.[madMid]
+        calculateMAD values median
 
 // --- Output Image Functions ---
 
@@ -322,32 +319,6 @@ let createDetectHeaders (starCount: int) (threshold: float) (gridSize: int) =
         XisfFitsKeyword("STARGRID", gridSize.ToString(), "Background grid size") :> XisfCoreElement
         XisfFitsKeyword("HISTORY", "", "Star detection by XisfPrep Align (detect mode)") :> XisfCoreElement
     |]
-
-/// Create output image with source geometry and additional headers
-let createOutputImage (source: XisfImage) (pixelData: byte[]) (outputFormat: XisfSampleFormat) (headers: XisfCoreElement[]) =
-    let dataBlock = InlineDataBlock(ReadOnlyMemory(pixelData), XisfEncoding.Base64)
-    let bounds =
-        match PixelIO.getBoundsForFormat outputFormat with
-        | Some b -> b
-        | None -> Unchecked.defaultof<XisfImageBounds>
-
-    let combinedHeaders =
-        if isNull source.AssociatedElements then headers
-        else Array.append (source.AssociatedElements :> seq<_> |> Seq.toArray) headers
-
-    XisfImage(
-        source.Geometry, outputFormat, source.ColorSpace, dataBlock, bounds,
-        source.PixelStorage, source.ImageType, source.Offset, source.Orientation,
-        source.ImageId, source.Uuid, source.Properties, combinedHeaders)
-
-/// Write output image to disk
-let writeOutputFile (outputPath: string) (image: XisfImage) =
-    async {
-        let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align v1.0")
-        let outUnit = XisfFactory.CreateMonolithic(metadata, image)
-        let writer = new XisfWriter()
-        do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask
-    }
 
 /// Paint detected stars as circles on black background
 let paintDetectedStars (pixels: byte[]) (width: int) (height: int) (channels: int) (format: XisfSampleFormat) (stars: DetectedStar[]) (intensity: float) =
@@ -385,7 +356,7 @@ let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (
                 if channels = 1 then pixelFloats
                 else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
 
-            let mad = calculateMAD channel0
+            let mad = calculateChannelMAD channel0
             let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
             let stars = starsResult.Stars
 
@@ -395,11 +366,139 @@ let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (
             paintDetectedStars pixels width height channels format stars intensity
 
             let headers = createDetectHeaders stars.Length detectionParams.Threshold detectionParams.GridSize
-            let outputImage = createOutputImage img pixels format headers
+            let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
+            let outputImage = createOutputImage img pixels format headers inPlaceKeys
 
-            do! writeOutputFile outPath outputImage
+            do! writeOutputFile outPath outputImage "XisfPrep Align v1.0"
 
             printfn $"  {stars.Length} stars -> {outFileName}"
+            return true
+        with ex ->
+            Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
+            return false
+    }
+
+/// Create FITS headers for match output
+let createMatchHeaders (targetStars: int) (matchedCount: int) (unmatchedCount: int) (refStars: int) (diag: AlignmentDiagnostics) =
+    [|
+        XisfFitsKeyword("IMAGETYP", "MATCHMAP", "Type of image") :> XisfCoreElement
+        XisfFitsKeyword("SWCREATE", "XisfPrep Align", "Software that created this file") :> XisfCoreElement
+        XisfFitsKeyword("TGTstars", targetStars.ToString(), "Stars detected in target") :> XisfCoreElement
+        XisfFitsKeyword("REFSTARS", refStars.ToString(), "Stars in reference") :> XisfCoreElement
+        XisfFitsKeyword("MATCHED", matchedCount.ToString(), "Matched star pairs") :> XisfCoreElement
+        XisfFitsKeyword("UNMATCHD", unmatchedCount.ToString(), "Unmatched target stars") :> XisfCoreElement
+        XisfFitsKeyword("TRIFORME", diag.TrianglesFormed.ToString(), "Triangles formed") :> XisfCoreElement
+        XisfFitsKeyword("TRIMATCD", diag.TrianglesMatched.ToString(), "Triangles matched") :> XisfCoreElement
+        XisfFitsKeyword("MATCHPCT", sprintf "%.1f" diag.MatchPercentage, "Triangle match percentage") :> XisfCoreElement
+        XisfFitsKeyword("TOPVOTES", diag.TopVoteCount.ToString(), "Top correspondence votes") :> XisfCoreElement
+        match diag.EstimatedTransform with
+        | Some (dx, dy, rot, scale) ->
+            XisfFitsKeyword("XSHIFT", sprintf "%.2f" dx, "Estimated X shift (pixels)") :> XisfCoreElement
+            XisfFitsKeyword("YSHIFT", sprintf "%.2f" dy, "Estimated Y shift (pixels)") :> XisfCoreElement
+            XisfFitsKeyword("ROTATION", sprintf "%.4f" rot, "Estimated rotation (degrees)") :> XisfCoreElement
+            XisfFitsKeyword("SCALE", sprintf "%.6f" scale, "Estimated scale factor") :> XisfCoreElement
+        | None -> ()
+        XisfFitsKeyword("HISTORY", "", "Match visualization by XisfPrep Align (match mode)") :> XisfCoreElement
+    |]
+
+/// Paint match visualization: circles=matched, X=unmatched, gaussian=reference
+let paintMatchVisualization
+    (pixels: byte[]) (width: int) (height: int) (channels: int) (format: XisfSampleFormat)
+    (targetStars: DetectedStar[]) (refStars: DetectedStar[])
+    (matchedIndices: Set<int>) (intensity: float) =
+
+    // Paint reference stars as gaussians (faint, shows where stars should be)
+    let refIntensity = intensity * 0.3
+    for star in refStars do
+        for ch in 0 .. channels - 1 do
+            paintGaussian pixels width height channels ch star.X star.Y star.FWHM refIntensity format
+
+    // Paint target stars
+    for i, star in targetStars |> Array.indexed do
+        let size = star.FWHM * 2.0
+        if matchedIndices.Contains i then
+            // Matched: circle
+            for ch in 0 .. channels - 1 do
+                paintCircle pixels width height channels ch star.X star.Y size intensity format
+        else
+            // Unmatched: X marker
+            for ch in 0 .. channels - 1 do
+                paintX pixels width height channels ch star.X star.Y size intensity format
+
+/// Process single file in match mode
+let processMatchFile
+    (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool)
+    (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams)
+    (refStars: DetectedStar[]) (refTriangles: Triangle[])
+    (opts: AlignOptions) =
+    async {
+        try
+            let fileName = Path.GetFileName(inputPath)
+            let baseName = Path.GetFileNameWithoutExtension(inputPath)
+            let outFileName = $"{baseName}{suffix}.xisf"
+            let outPath = Path.Combine(outputDir, outFileName)
+
+            if File.Exists(outPath) && not overwrite then
+                Log.Warning($"Output '{outFileName}' exists, skipping (use --overwrite)")
+                return true
+            else
+
+            // Read image
+            let reader = new XisfReader()
+            let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask
+            let img = unit.Images.[0]
+
+            let width = int img.Geometry.Width
+            let height = int img.Geometry.Height
+            let channels = int img.Geometry.ChannelCount
+
+            // Get pixel data and detect stars
+            let pixelFloats = PixelIO.readPixelsAsFloat img
+            let channel0 =
+                if channels = 1 then pixelFloats
+                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+
+            let mad = calculateChannelMAD channel0
+            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let targetStars = starsResult.Stars
+
+            // Run matching
+            let diag = runDiagnostic refStars refTriangles targetStars fileName opts.RatioTolerance opts.MaxStarsTriangles opts.MinVotes
+
+            // Get matched target star indices from correspondences
+            let targetTriangles = formTriangles targetStars opts.MaxStarsTriangles
+            let matches = matchTriangles refTriangles targetTriangles opts.RatioTolerance
+            let correspondences = voteForCorrespondences matches
+
+            // Target stars that have enough votes are considered matched
+            let matchedTargetIndices =
+                correspondences
+                |> Map.toSeq
+                |> Seq.filter (fun ((_, _), votes) -> votes >= opts.MinVotes)
+                |> Seq.map (fun ((_, targetIdx), _) -> targetIdx)
+                |> Set.ofSeq
+
+            let matchedCount = matchedTargetIndices.Count
+            let unmatchedCount = targetStars.Length - matchedCount
+
+            // Create output
+            let format = outputFormat |> Option.defaultValue img.SampleFormat
+            let pixels = createBlackPixels width height channels format
+            paintMatchVisualization pixels width height channels format targetStars refStars matchedTargetIndices opts.Intensity
+
+            let headers = createMatchHeaders targetStars.Length matchedCount unmatchedCount refStars.Length diag
+            let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
+            let outputImage = createOutputImage img pixels format headers inPlaceKeys
+
+            do! writeOutputFile outPath outputImage "XisfPrep Align v1.0"
+
+            // Format transform info for output
+            let transformStr =
+                match diag.EstimatedTransform with
+                | Some (dx, dy, rot, scale) -> sprintf "dx=%.1f dy=%.1f rot=%.2f°" dx dy rot
+                | None -> "N/A"
+
+            printfn $"  {matchedCount}/{targetStars.Length} matched -> {outFileName} ({transformStr})"
             return true
         with ex ->
             Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
@@ -636,11 +735,20 @@ let run (args: string array) =
                     if channels = 1 then refPixels
                     else Array.init (width * height) (fun i -> refPixels.[i * channels])
 
-                let refMAD = calculateMAD refChannel0
+                let refMAD = calculateChannelMAD refChannel0
 
                 printfn $"Detecting stars in reference (MAD: {refMAD:F2})..."
 
-                let detectionParams = StarDetection.defaultParams
+                // Build detection params from user options
+                let detectionParams: DetectionParams = {
+                    Threshold = opts.Threshold
+                    GridSize = opts.GridSize
+                    MinFWHM = opts.MinFWHM
+                    MaxFWHM = opts.MaxFWHM
+                    MaxEccentricity = opts.MaxEccentricity
+                    MaxStars = Some opts.MaxStars
+                }
+
                 let refStarsResult =
                     StarDetection.detectStarsInChannel
                         refChannel0 width height refMAD 0 "Luminance" detectionParams
@@ -654,8 +762,7 @@ let run (args: string array) =
                 else
 
                 // Form triangles from reference stars
-                let maxStarsForTriangles = 100  // Use top 100 stars
-                let refTriangles = formTriangles refStars maxStarsForTriangles
+                let refTriangles = formTriangles refStars opts.MaxStarsTriangles
 
                 printfn $"Reference triangles formed: {refTriangles.Length}"
                 printfn ""
@@ -671,22 +778,12 @@ let run (args: string array) =
                         Directory.CreateDirectory(opts.Output) |> ignore
                         Log.Information($"Created output directory: {opts.Output}")
 
-                    // Build detection params
-                    let detectParams: DetectionParams = {
-                        Threshold = opts.Threshold
-                        GridSize = opts.GridSize
-                        MinFWHM = opts.MinFWHM
-                        MaxFWHM = opts.MaxFWHM
-                        MaxEccentricity = opts.MaxEccentricity
-                        MaxStars = Some opts.MaxStars
-                    }
-
                     // Use _det suffix for detect mode
                     let suffix = if opts.Suffix = defaultSuffix then "_det" else opts.Suffix
 
                     // Process all files in parallel
                     let tasks = files |> Array.map (fun f ->
-                        processDetectFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectParams opts.Intensity)
+                        processDetectFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams opts.Intensity)
                     let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                     let successCount = results |> Array.filter id |> Array.length
@@ -698,58 +795,30 @@ let run (args: string array) =
                     return if failCount > 0 then 1 else 0
 
                 | Match ->
-                    // Match mode: show star correspondences (not yet implemented)
-                    // For now, run diagnostic analysis
-                    printfn "Running triangle matching analysis..."
+                    // Match mode: show star correspondences
+                    printfn "Output mode: match (correspondence visualization)"
                     printfn ""
-                    printfn "%-40s %6s %8s %8s %7s %6s %s"
-                        "File" "Stars" "Triangles" "Matched" "Match%" "Votes" "Transform"
-                    printfn "%s" (String.replicate 110 "-")
 
-                    for file in files do
-                        let fileName = Path.GetFileName file
+                    // Create output directory if needed
+                    if not (Directory.Exists(opts.Output)) then
+                        Directory.CreateDirectory(opts.Output) |> ignore
+                        Log.Information($"Created output directory: {opts.Output}")
 
-                        // Load target image
-                        let! targetUnit = reader.ReadAsync(file) |> Async.AwaitTask
-                        let targetImage = targetUnit.Images.[0]
+                    // Use _mat suffix for match mode
+                    let suffix = if opts.Suffix = defaultSuffix then "_mat" else opts.Suffix
 
-                        // Get pixel data
-                        let targetPixels = PixelIO.readPixelsAsFloat targetImage
-                        let targetChannel0 =
-                            if channels = 1 then targetPixels
-                            else Array.init (width * height) (fun i -> targetPixels.[i * channels])
+                    // Process all files in parallel
+                    let tasks = files |> Array.map (fun f ->
+                        processMatchFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams refStars refTriangles opts)
+                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
-                        let targetMAD = calculateMAD targetChannel0
-
-                        // Detect stars
-                        let targetStarsResult =
-                            StarDetection.detectStarsInChannel
-                                targetChannel0 width height targetMAD 0 "Luminance" detectionParams
-
-                        let targetStars = targetStarsResult.Stars
-
-                        // Run diagnostic
-                        let diag = runDiagnostic refStars refTriangles targetStars fileName opts.RatioTolerance opts.MaxStarsTriangles
-
-                        // Format transform
-                        let transformStr =
-                            match diag.EstimatedTransform with
-                            | Some (dx, dy, rot, scale) ->
-                                sprintf "dx=%.1f dy=%.1f rot=%.2f° s=%.4f" dx dy rot scale
-                            | None -> "N/A"
-
-                        printfn "%-40s %6d %8d %8d %6.1f%% %6d %s"
-                            (if fileName.Length > 40 then fileName.Substring(0, 37) + "..." else fileName)
-                            diag.DetectedStars
-                            diag.TrianglesFormed
-                            diag.TrianglesMatched
-                            diag.MatchPercentage
-                            diag.TopVoteCount
-                            transformStr
+                    let successCount = results |> Array.filter id |> Array.length
+                    let failCount = results.Length - successCount
 
                     printfn ""
-                    printfn "Match analysis complete."
-                    return 0
+                    printfn $"Completed: {successCount} succeeded, {failCount} failed"
+
+                    return if failCount > 0 then 1 else 0
 
                 | Align ->
                     // Align mode: apply transformation (not yet implemented)
