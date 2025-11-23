@@ -73,10 +73,12 @@ type AlignOptions = {
 // --- Triangle Matching Types ---
 
 type Triangle = {
-    /// Indices into the star array
-    I1: int
-    I2: int
-    I3: int
+    /// Indices into the ORIGINAL star array, sorted geometrically:
+    /// [0] = Vertex opposite Side A (Shortest side)
+    /// [1] = Vertex opposite Side B (Middle side)
+    /// [2] = Vertex opposite Side C (Longest side)
+    Vertices: int[] 
+    
     /// Side lengths sorted ascending (scale-invariant descriptor)
     SideA: float  // shortest
     SideB: float  // middle
@@ -107,13 +109,14 @@ type AlignmentDiagnostics = {
 /// Form triangles from the brightest N stars
 /// Returns triangles with scale/rotation invariant descriptors
 let formTriangles (stars: DetectedStar[]) (maxStars: int) : Triangle[] =
-    // Use only brightest stars for efficiency
-    let topStars =
+    // 1. Preserve ORIGINAL indices by pairing them before sorting/filtering
+    let topStarsWithIndices =
         stars
-        |> Array.sortByDescending (fun s -> s.Flux)
+        |> Array.indexed // Creates (originalIndex, Star) tuple
+        |> Array.sortByDescending (fun (_, s) -> s.Flux)
         |> Array.truncate maxStars
 
-    let n = topStars.Length
+    let n = topStarsWithIndices.Length
     if n < 3 then [||]
     else
         let triangles = ResizeArray<Triangle>()
@@ -122,28 +125,42 @@ let formTriangles (stars: DetectedStar[]) (maxStars: int) : Triangle[] =
         for i in 0 .. n - 3 do
             for j in i + 1 .. n - 2 do
                 for k in j + 1 .. n - 1 do
-                    let s1 = topStars.[i]
-                    let s2 = topStars.[j]
-                    let s3 = topStars.[k]
+                    // Extract original indices and star objects
+                    let (idx1, s1) = topStarsWithIndices.[i]
+                    let (idx2, s2) = topStarsWithIndices.[j]
+                    let (idx3, s3) = topStarsWithIndices.[k]
 
                     // Calculate side lengths
                     let d12 = sqrt ((s1.X - s2.X) ** 2.0 + (s1.Y - s2.Y) ** 2.0)
                     let d23 = sqrt ((s2.X - s3.X) ** 2.0 + (s2.Y - s3.Y) ** 2.0)
                     let d31 = sqrt ((s3.X - s1.X) ** 2.0 + (s3.Y - s1.Y) ** 2.0)
 
-                    // Sort sides ascending for rotation invariance
-                    let sides = [| d12; d23; d31 |] |> Array.sort
-                    let sideA, sideB, sideC = sides.[0], sides.[1], sides.[2]
+                    // Create array of (Length, OppositeVertexOriginalIndex)
+                    // d12 connects 1-2, so opposite is 3
+                    // d23 connects 2-3, so opposite is 1
+                    // d31 connects 3-1, so opposite is 2
+                    let rawSides : (float * int)[] = 
+                        [| (d12, idx3); (d23, idx1); (d31, idx2) |]
 
-                    // Skip degenerate triangles (collinear or too small)
+                    // Sort by length (ascending) to establish geometry
+                    // Array.sortBy fst automatically uses the float length for sorting
+                    let sortedSides = rawSides |> Array.sortBy fst
+
+                    let sideA = fst sortedSides.[0] // Shortest
+                    let sideB = fst sortedSides.[1] // Middle
+                    let sideC = fst sortedSides.[2] // Longest
+
+                    // Extract the vertices in geometric order (Opposite Shortest, Opposite Middle, Opposite Longest)
+                    let orderedVertices = 
+                        [| snd sortedSides.[0]; snd sortedSides.[1]; snd sortedSides.[2] |]
+
+                    // Skip degenerate triangles
                     if sideA > 5.0 && sideC > 0.0 then
                         let ratioAB = sideA / sideB
                         let ratioBC = sideB / sideC
 
                         triangles.Add {
-                            I1 = i
-                            I2 = j
-                            I3 = k
+                            Vertices = orderedVertices
                             SideA = sideA
                             SideB = sideB
                             SideC = sideC
@@ -179,17 +196,13 @@ let voteForCorrespondences (matches: TriangleMatch[]) : Map<(int * int), int> =
     let votes = System.Collections.Generic.Dictionary<(int * int), int>()
 
     for m in matches do
-        // Each triangle match votes for 3 star correspondences
-        // We need to figure out which vertices correspond
-        // Since sides are sorted, we use the vertex opposite each side
-
-        let refIndices = [| m.RefTriangle.I1; m.RefTriangle.I2; m.RefTriangle.I3 |]
-        let targetIndices = [| m.TargetTriangle.I1; m.TargetTriangle.I2; m.TargetTriangle.I3 |]
-
-        // Simple approach: try all 6 possible mappings and use the one consistent with ratios
-        // For now, use direct correspondence (this works when triangles are formed consistently)
+        // Since Vertices are sorted geometrically (Opposite Shortest, Opposite Middle, Opposite Longest),
+        // we can map them directly index-to-index.
         for i in 0 .. 2 do
-            let pair = (refIndices.[i], targetIndices.[i])
+            let refIdx = m.RefTriangle.Vertices.[i]
+            let targetIdx = m.TargetTriangle.Vertices.[i]
+            let pair = (refIdx, targetIdx)
+            
             if votes.ContainsKey pair then
                 votes.[pair] <- votes.[pair] + 1
             else
@@ -206,52 +219,91 @@ let estimateTransform
     (minVotes: int)
     : (float * float * float * float) option =
 
-    // Filter by vote count and collect point pairs
+    // Filter by vote count
+    let aboveThreshold =
+        correspondences |> Array.filter (fun (_, votes) -> votes >= minVotes)
+
+    // Select best target for each reference star (highest votes)
+    let bestPerRef =
+        aboveThreshold
+        |> Array.groupBy (fun ((refIdx, _), _) -> refIdx)
+        |> Array.map (fun (_, group) ->
+            group |> Array.maxBy (fun (_, votes) -> votes))
+
+    // Also ensure each target is used only once (full bijective mapping)
+    let filteredCorrespondences =
+        bestPerRef
+        |> Array.groupBy (fun ((_, targetIdx), _) -> targetIdx)
+        |> Array.map (fun (_, group) ->
+            group |> Array.maxBy (fun (_, votes) -> votes))
+
+    // Debug: log first few correspondences
+    for i in 0 .. min 4 (filteredCorrespondences.Length - 1) do
+        let ((refIdx, targetIdx), votes) = filteredCorrespondences.[i]
+        let r = refStars.[refIdx]
+        let t = targetStars.[targetIdx]
+        Log.Verbose("Pair {I}: Ref[{RefIdx}]=({RefX:F1},{RefY:F1}) -> Target[{TargetIdx}]=({TargetX:F1},{TargetY:F1}) votes={Votes}",
+            i, refIdx, r.X, r.Y, targetIdx, t.X, t.Y, votes)
+
     let pairs =
-        correspondences
-        |> Array.filter (fun (_, votes) -> votes >= minVotes)
+        filteredCorrespondences
         |> Array.map (fun ((refIdx, targetIdx), _) ->
             let r = refStars.[refIdx]
             let t = targetStars.[targetIdx]
             (r.X, r.Y, t.X, t.Y))
 
+    // Debug: count pairs with matching vs mismatching coordinates
+    let matchingCount = pairs |> Array.filter (fun (rx, ry, tx, ty) ->
+        abs(rx - tx) < 0.1 && abs(ry - ty) < 0.1) |> Array.length
+    Log.Verbose("Total pairs for transform: {Count} ({Matching} with matching coords)",
+        pairs.Length, matchingCount)
+
     if pairs.Length < 2 then None
     else
         // Solve for similarity transform:
-        // x' = a*x - b*y + dx
-        // y' = b*x + a*y + dy
+        // Rx = a*Tx - b*Ty + dx
+        // Ry = b*Tx + a*Ty + dy
         // Where scale = sqrt(a² + b²), rotation = atan2(b, a)
 
-        // Using least squares: minimize sum of squared errors
         let n = float pairs.Length
 
-        let sumX = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx)
-        let sumY = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty)
-        let sumXp = pairs |> Array.sumBy (fun (rx, _, _, _) -> rx)
-        let sumYp = pairs |> Array.sumBy (fun (_, ry, _, _) -> ry)
+        // T = Target (x, y), R = Reference (rx, ry)
+        let sumTx = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx)
+        let sumTy = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty)
+        let sumRx = pairs |> Array.sumBy (fun (rx, _, _, _) -> rx)
+        let sumRy = pairs |> Array.sumBy (fun (_, ry, _, _) -> ry)
 
-        let sumXXp = pairs |> Array.sumBy (fun (rx, _, tx, _) -> tx * rx)
-        let sumXYp = pairs |> Array.sumBy (fun (_, ry, tx, _) -> tx * ry)
-        let sumYXp = pairs |> Array.sumBy (fun (rx, _, _, ty) -> ty * rx)
-        let sumYYp = pairs |> Array.sumBy (fun (_, ry, _, ty) -> ty * ry)
+        let sumTxRx = pairs |> Array.sumBy (fun (rx, _, tx, _) -> tx * rx)
+        let sumTyRy = pairs |> Array.sumBy (fun (_, ry, _, ty) -> ty * ry)
+        
+        let sumTxRy = pairs |> Array.sumBy (fun (_, ry, tx, _) -> tx * ry)
+        let sumTyRx = pairs |> Array.sumBy (fun (rx, _, _, ty) -> ty * rx)
 
-        let sumXX = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx * tx)
-        let sumYY = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty * ty)
-        let sumXY = pairs |> Array.sumBy (fun (_, _, tx, ty) -> tx * ty)
+        let sumTx2 = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx * tx)
+        let sumTy2 = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty * ty)
 
-        // Solve the normal equations
-        let denom = n * (sumXX + sumYY) - sumX * sumX - sumY * sumY
+        // Denominator
+        let denom = n * (sumTx2 + sumTy2) - sumTx * sumTx - sumTy * sumTy
+
+        Log.Verbose("Sums: n={N} sumTx={SumTx:F1} sumTy={SumTy:F1} sumRx={SumRx:F1} sumRy={SumRy:F1}",
+            n, sumTx, sumTy, sumRx, sumRy)
+        Log.Verbose("Cross: sumTxRx={TxRx:F1} sumTyRy={TyRy:F1} sumTxRy={TxRy:F1} sumTyRx={TyRx:F1}",
+            sumTxRx, sumTyRy, sumTxRy, sumTyRx)
+        Log.Verbose("Denom={Denom:F1}", denom)
 
         if abs denom < 1e-10 then None
         else
-            let a = (n * (sumXXp + sumYYp) - sumX * sumXp - sumY * sumYp) / denom
-            let b = (n * (sumYXp - sumXYp) - sumY * sumXp + sumX * sumYp) / denom
+            let a = (n * (sumTxRx + sumTyRy) - sumTx * sumRx - sumTy * sumRy) / denom
+            let b = (n * (sumTxRy - sumTyRx) - sumTx * sumRy + sumTy * sumRx) / denom // Corrected sign
 
-            let dx = (sumXp - a * sumX + b * sumY) / n
-            let dy = (sumYp - b * sumX - a * sumY) / n
+            let dx = (sumRx - a * sumTx + b * sumTy) / n
+            let dy = (sumRy - b * sumTx - a * sumTy) / n
 
             let scale = sqrt (a * a + b * b)
             let rotation = atan2 b a * 180.0 / Math.PI
+
+            Log.Verbose("Transform: a={A:F4} b={B:F4} dx={Dx:F2} dy={Dy:F2} rot={Rot:F2}° scale={Scale:F4}",
+                a, b, dx, dy, rotation, scale)
 
             Some (dx, dy, rotation, scale)
 
