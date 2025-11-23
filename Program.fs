@@ -26,6 +26,7 @@ let showUsage() =
     printfn "  align       Register images to reference"
     printfn "  integrate   Stack/combine multiple images"
     printfn "  stats       Calculate image statistics"
+    printfn "  stars       Detect stars and generate visualization"
     printfn "  convert     Format conversion and export"
     printfn "  bin         Downsample images by binning pixels"
     printfn "  inspect     Diagnostic inspection of XISF file structure"
@@ -45,6 +46,7 @@ let commandHandlers =
         "align", Commands.Align.run
         "integrate", Commands.Integrate.run
         "stats", Commands.Stats.run
+        "stars", Commands.Stars.run
         "convert", Commands.Convert.run
         "bin", Commands.Bin.run
         "inspect", Commands.Inspect.run

@@ -43,7 +43,7 @@ let defaultParams = {
     MinFWHM = 1.5
     MaxFWHM = 20.0
     MaxEccentricity = 0.5
-    MaxStars = Some 5000
+    MaxStars = Some 20000
 }
 
 let estimateLocalBackground (values: float[]) width height gridSize =

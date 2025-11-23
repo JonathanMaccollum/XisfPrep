@@ -15,6 +15,7 @@
     <Compile Include="Commands\Align.fs" />
     <Compile Include="Commands\Integrate.fs" />
     <Compile Include="Commands\Stats.fs" />
+    <Compile Include="Commands\Stars.fs" />
     <Compile Include="Commands\Convert.fs" />
     <Compile Include="Commands\Bin.fs" />
     <Compile Include="Commands\Inspect.fs" />
