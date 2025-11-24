@@ -277,6 +277,35 @@ xisfprep align --input "images/*.xisf" --output "aligned/" \
 - Suffix: `_a`
 - Purpose: Actual image alignment
 
+*Distortion Mode:* (`--output-mode distortion`)
+- Output: RGB heatmap visualization of distortion field
+- Suffix: `_dist`
+- Color scale: Blue (low) → Cyan → Green → Yellow → Red (high)
+- Max scale: 10px distortion
+- White circles: RBF control point locations
+- Purpose: Visualize non-linear distortion correction field
+
+**Distortion Correction:**
+- `--distortion <type>` - Correction method (default: none)
+  - `none` - Similarity transform only (translation, rotation, scale)
+  - `wendland` - Compact support RBF (recommended, O(log N) evaluation)
+  - `tps` - Thin-plate spline (global, O(N) evaluation)
+  - `imq` - Inverse multiquadric (global, O(N) evaluation)
+- `--rbf-support <factor>` - Wendland support radius factor (default: 3.0)
+- `--rbf-regularization <value>` - Regularization parameter (default: 1e-6)
+
+**Diagnostic Outputs:**
+- `--show-distortion-stats` - Print console ASCII heatmap in distortion mode
+  - Shows 10-column grid with distortion magnitude at each cell
+  - Includes min/max/mean/stddev statistics
+  - ASCII shading: · (<2px), ░ (2-4px), ▒ (4-6px), ▓ (6-8px), █ (≥8px)
+- `--include-distortion-model` - Output distortion heatmap alongside aligned images
+  - Creates `_dist.xisf` file for each aligned image
+  - Useful for quality control and troubleshooting
+- `--include-detection-model` - Output detection visualization alongside aligned images
+  - Creates `_det.xisf` file showing matched/unmatched stars
+  - Useful for validating star detection quality
+
 **Process (Expanding Algorithm - Default):**
 1. Detect stars in reference frame
 2. Select anchor stars from center (or grid) in reference and target

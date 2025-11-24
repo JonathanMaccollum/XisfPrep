@@ -12,6 +12,7 @@ open Algorithms.OutputImage
 open Algorithms.TriangleMatch
 open Algorithms.SpatialMatch
 open Algorithms.Interpolation
+open Algorithms.RBFTransform
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
@@ -26,9 +27,16 @@ type MatchAlgorithm =
 type InterpolationMethod = Algorithms.Interpolation.InterpolationMethod
 
 type OutputMode =
-    | Detect  // Show detected stars only
-    | Match   // Show matched star correspondences
-    | Align   // Apply transformation (default)
+    | Detect      // Show detected stars only
+    | Match       // Show matched star correspondences
+    | Align       // Apply transformation (default)
+    | Distortion  // Visualize distortion field
+
+type DistortionCorrection =
+    | NoDistortion   // Similarity only
+    | Wendland       // Compact support (recommended)
+    | TPS            // Thin-plate spline
+    | IMQ            // Inverse multiquadric
 
 // --- Defaults ---
 let private defaultInterpolation = Lanczos3
@@ -51,6 +59,10 @@ let private defaultIntensity = 1.0
 let private defaultAlgorithm = Expanding
 let private defaultAnchorStars = 12
 let private defaultAnchorDistribution = SpatialMatch.Center
+// Distortion correction defaults
+let private defaultDistortion = NoDistortion
+let private defaultRBFSupportFactor = 3.0
+let private defaultRBFRegularization = 1e-6
 // ---
 
 type AlignOptions = {
@@ -81,6 +93,14 @@ type AlignOptions = {
     Algorithm: MatchAlgorithm
     AnchorStars: int
     AnchorDistribution: SpatialMatch.AnchorDistribution
+    // Distortion correction
+    Distortion: DistortionCorrection
+    RBFSupportFactor: float
+    RBFRegularization: float
+    // Additional outputs
+    ShowDistortionStats: bool
+    IncludeDistortionModel: bool
+    IncludeDetectionModel: bool
 }
 
 // --- Helper Functions ---
@@ -106,10 +126,10 @@ let transformImage
     (height: int)
     (channels: int)
     (transform: SimilarityTransform)
+    (rbfCoeffs: RBFTransform.RBFCoefficients option)
     (interpolation: InterpolationMethod)
     : float[] =
 
-    let inverse = invertTransform transform
     let pixelCount = width * height
 
     // Pre-extract channels for efficient sampling
@@ -127,8 +147,8 @@ let transformImage
         let ox = pixIdx % width
         let oy = pixIdx / width
 
-        // Transform output coords to target coords
-        let (tx, ty) = applyTransform inverse (float ox) (float oy)
+        // Transform output coords to target coords (with RBF if available)
+        let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfCoeffs (float ox) (float oy) 5 0.01
 
         // Sample each channel
         for ch in 0 .. channels - 1 do
@@ -383,6 +403,20 @@ let createAlignHeaders (transform: SimilarityTransform) (matchedCount: int) (ref
         XisfFitsKeyword("HISTORY", "", "Aligned by XisfPrep Align v1.0") :> XisfCoreElement
     |]
 
+/// Map magnitude to color (blue -> cyan -> green -> yellow -> red)
+let magnitudeToColor (mag: float) (maxMag: float) : uint16 * uint16 * uint16 =
+    let t = min 1.0 (mag / maxMag)
+    let (r, g, b) =
+        if t < 0.25 then
+            (0.0, t * 4.0, 1.0)
+        elif t < 0.5 then
+            (0.0, 1.0, 1.0 - (t - 0.25) * 4.0)
+        elif t < 0.75 then
+            ((t - 0.5) * 4.0, 1.0, 0.0)
+        else
+            (1.0, 1.0 - (t - 0.75) * 4.0, 0.0)
+    (uint16 (r * 65535.0), uint16 (g * 65535.0), uint16 (b * 65535.0))
+
 /// Process single file in align mode - apply transformation
 let processAlignFile
     (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool)
@@ -449,15 +483,17 @@ let processAlignFile
                         |> Array.groupBy (fun ((_, targetIdx), _) -> targetIdx)
                         |> Array.map (fun (_, group) -> group |> Array.maxBy snd)
 
+                    let matchedPairs = bijective |> Array.map (fun ((refIdx, targetIdx), _) -> (refIdx, targetIdx))
+
                     let pairs =
-                        bijective
-                        |> Array.map (fun ((refIdx, targetIdx), _) ->
+                        matchedPairs
+                        |> Array.map (fun (refIdx, targetIdx) ->
                             let r = refStars.[refIdx]
                             let t = targetStars.[targetIdx]
                             (r.X, r.Y, t.X, t.Y))
 
                     match estimateTransformFromPairs pairs with
-                    | Some t -> Some (t, bijective.Length)
+                    | Some t -> Some (t, matchedPairs)
                     | None -> None
 
                 | Expanding ->
@@ -471,15 +507,67 @@ let processAlignFile
                     }
 
                     let result = matchExpanding refStars targetStars width height config
-                    result.Transform |> Option.map (fun t -> (t, result.TotalInliers))
+
+                    // Extract matched pairs by finding correspondences via inverse transform
+                    match result.Transform with
+                    | Some transform ->
+                        let inverse = invertTransform transform
+                        let targetTree =
+                            targetStars
+                            |> Array.indexed
+                            |> Array.map (fun (i, s) -> (s, i))
+                            |> buildKdTree
+
+                        let matchedPairs = ResizeArray<int * int>()
+                        for refIdx in 0 .. refStars.Length - 1 do
+                            let refStar = refStars.[refIdx]
+                            let (predX, predY) = applyTransform inverse refStar.X refStar.Y
+                            match findNearest targetTree predX predY with
+                            | Some (_, targetIdx, dist) when dist < 15.0 ->
+                                matchedPairs.Add((refIdx, targetIdx))
+                            | _ -> ()
+
+                        Some (transform, matchedPairs.ToArray())
+                    | None -> None
 
             match matchResult with
             | None ->
                 Log.Error($"Failed to compute transform for {fileName}")
                 return false
-            | Some (transform, matchedCount) ->
+            | Some (transform, matchedPairs) ->
+                // Compute RBF distortion correction if enabled
+                let (rbfCoeffs, rbfInfo) =
+                    match opts.Distortion with
+                    | NoDistortion -> (None, "")
+                    | _ ->
+                        let rbfKernel =
+                            match opts.Distortion with
+                            | Wendland -> RBFTransform.Wendland 1
+                            | TPS -> RBFTransform.ThinPlateSpline
+                            | IMQ -> RBFTransform.InverseMultiquadric
+                            | NoDistortion -> RBFTransform.Wendland 1
+
+                        let rbfConfig: RBFTransform.RBFConfig = {
+                            Kernel = rbfKernel
+                            SupportRadiusFactor = opts.RBFSupportFactor
+                            ShapeFactor = 0.5
+                            Regularization = opts.RBFRegularization
+                            MinControlPoints = 20
+                            MaxControlPoints = 500
+                        }
+
+                        let rbfResult = RBFTransform.setupRBF refStars targetStars matchedPairs transform rbfConfig width height
+
+                        match rbfResult.Coefficients with
+                        | Some coeffs ->
+                            let distName = match opts.Distortion with Wendland -> "wend" | TPS -> "tps" | IMQ -> "imq" | _ -> ""
+                            (Some coeffs, sprintf " [%s rms=%.2f]" distName rbfResult.ResidualRMS)
+                        | None ->
+                            Log.Warning($"RBF setup failed for {fileName}, using similarity only")
+                            (None, " [rbf failed]")
+
                 // Apply transformation
-                let transformedPixels = transformImage pixelFloats width height channels transform opts.Interpolation
+                let transformedPixels = transformImage pixelFloats width height channels transform rbfCoeffs opts.Interpolation
 
                 // Output as float32 for interpolation precision
                 // normalize=true converts [0, 65535] → [0, 1] for Float32
@@ -494,14 +582,352 @@ let processAlignFile
                     | Bicubic -> "bicubic"
                     | Lanczos3 -> "lanczos3"
 
-                let headers = createAlignHeaders transform matchedCount refFileName interpName
+                let headers = createAlignHeaders transform matchedPairs.Length refFileName interpName
                 let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
                 let outputImage = createOutputImage img outputBytes outputFormat headers inPlaceKeys
 
                 do! writeOutputFile outPath outputImage "XisfPrep Align v1.0"
 
+                // Output additional diagnostic files if requested
+                if opts.IncludeDetectionModel then
+                    let detFileName = $"{baseName}_det.xisf"
+                    let detPath = Path.Combine(outputDir, detFileName)
+                    let detPixels = createBlackPixels width height channels XisfSampleFormat.UInt16
+                    paintDetectedStars detPixels width height channels XisfSampleFormat.UInt16 targetStars opts.Intensity
+                    let detHeaders = createDetectHeaders targetStars.Length detectionParams.Threshold detectionParams.GridSize
+                    let detInPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
+                    let detOutputImage = createOutputImage img detPixels XisfSampleFormat.UInt16 detHeaders detInPlaceKeys
+                    do! writeOutputFile detPath detOutputImage "XisfPrep Align v1.0"
+
+                if opts.IncludeDistortionModel && rbfCoeffs.IsSome then
+                    let distFileName = $"{baseName}_dist.xisf"
+                    let distPath = Path.Combine(outputDir, distFileName)
+
+                    // Generate distortion heatmap
+                    let distPixels = Array.zeroCreate<byte> (width * height * 3 * 2) // RGB * UInt16
+                    let maxMag = 10.0
+
+                    Array.Parallel.iter (fun pixIdx ->
+                        let ox = pixIdx % width
+                        let oy = pixIdx / width
+                        let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfCoeffs (float ox) (float oy) 5 0.01
+                        let dx = float ox - tx
+                        let dy = float oy - ty
+                        let mag = sqrt (dx * dx + dy * dy)
+                        let (r, g, b) = magnitudeToColor mag maxMag
+                        let byteIdx = pixIdx * 6
+                        distPixels.[byteIdx] <- byte (r &&& 0xFFus)
+                        distPixels.[byteIdx + 1] <- byte (r >>> 8)
+                        distPixels.[byteIdx + 2] <- byte (g &&& 0xFFus)
+                        distPixels.[byteIdx + 3] <- byte (g >>> 8)
+                        distPixels.[byteIdx + 4] <- byte (b &&& 0xFFus)
+                        distPixels.[byteIdx + 5] <- byte (b >>> 8)
+                    ) [| 0 .. width * height - 1 |]
+
+                    // Overlay control points
+                    match rbfCoeffs with
+                    | Some coeffs ->
+                        for (cx, cy) in coeffs.ControlPoints do
+                            for ch in 0 .. 2 do
+                                paintCircle distPixels width height 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
+                    | None -> ()
+
+                    // Create RGB output image
+                    let distGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
+                    let distDataBlock = InlineDataBlock(ReadOnlyMemory(distPixels), XisfEncoding.Base64)
+                    let distBounds = PixelIO.getBoundsForFormat XisfSampleFormat.UInt16 |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
+
+                    let distOutputImage = XisfImage(
+                        distGeometry,
+                        XisfSampleFormat.UInt16,
+                        XisfColorSpace.RGB,
+                        distDataBlock,
+                        distBounds,
+                        XisfPixelStorage.Normal,
+                        img.ImageType,
+                        0.0,
+                        img.Orientation,
+                        "",
+                        Nullable<Guid>(),
+                        img.Properties,
+                        [||]
+                    )
+
+                    let distMetadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align v1.0")
+                    let distUnit = XisfFactory.CreateMonolithic(distMetadata, distOutputImage)
+                    let distWriter = new XisfWriter()
+                    do! distWriter.WriteAsync(distUnit, distPath) |> Async.AwaitTask
+
                 // Tidy output: dx=1.2 dy=-0.8 rot=0.12° -> filename_a.xisf
-                printfn $"  dx={transform.Dx:F1} dy={transform.Dy:F1} rot={transform.Rotation:F2}° -> {outFileName}"
+                printfn $"  dx={transform.Dx:F1} dy={transform.Dy:F1} rot={transform.Rotation:F2}° -> {outFileName}{rbfInfo}"
+                return true
+        with ex ->
+            Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
+            return false
+    }
+
+// --- Distortion Visualization ---
+
+/// Map magnitude to ASCII character for console display
+let magnitudeToAscii (mag: float) : char =
+    if mag < 2.0 then '·'
+    elif mag < 4.0 then '░'
+    elif mag < 6.0 then '▒'
+    elif mag < 8.0 then '▓'
+    else '█'
+
+/// Print console heatmap of distortion field
+let printDistortionHeatmap
+    (width: int) (height: int)
+    (transform: SimilarityTransform)
+    (rbfCoeffs: RBFCoefficients option)
+    (cols: int) =
+
+    let aspectRatio = float height / float width
+    let rows = max 1 (int (float cols * aspectRatio))
+
+    let cellWidth = float width / float cols
+    let cellHeight = float height / float rows
+
+    printfn ""
+    printfn "Distortion Field Heatmap (sampled at %dx%d grid)" cols rows
+    printfn "─────────────────────────────────────────────────────────────────"
+    printfn "Scale: █ ≥8px  ▓ 6-8px  ▒ 4-6px  ░ 2-4px  · <2px"
+    printfn ""
+
+    // Sample distortion at grid points
+    let samples = Array2D.zeroCreate rows cols
+    let mutable minMag = Double.MaxValue
+    let mutable maxMag = Double.MinValue
+    let mutable sumMag = 0.0
+    let mutable count = 0
+
+    for row in 0 .. rows - 1 do
+        for col in 0 .. cols - 1 do
+            // Sample at center of cell
+            let ox = (float col + 0.5) * cellWidth
+            let oy = (float row + 0.5) * cellHeight
+
+            let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfCoeffs ox oy 5 0.01
+
+            let dx = ox - tx
+            let dy = oy - ty
+            let mag = sqrt (dx * dx + dy * dy)
+
+            samples.[row, col] <- mag
+            minMag <- min minMag mag
+            maxMag <- max maxMag mag
+            sumMag <- sumMag + mag
+            count <- count + 1
+
+    let meanMag = sumMag / float count
+
+    // Compute standard deviation
+    let mutable sumSqDiff = 0.0
+    for row in 0 .. rows - 1 do
+        for col in 0 .. cols - 1 do
+            let diff = samples.[row, col] - meanMag
+            sumSqDiff <- sumSqDiff + diff * diff
+    let stdDev = sqrt (sumSqDiff / float count)
+
+    // Print values
+    for row in 0 .. rows - 1 do
+        // Print numeric values
+        for col in 0 .. cols - 1 do
+            printf "%5.1f " samples.[row, col]
+        printfn ""
+
+        // Print ASCII representation
+        for col in 0 .. cols - 1 do
+            let c = magnitudeToAscii samples.[row, col]
+            printf "  %c   " c
+        printfn ""
+        printfn ""
+
+    printfn "─────────────────────────────────────────────────────────────────"
+    printfn "Statistics:"
+    printfn "  Min: %.2fpx  Max: %.2fpx  Mean: %.2fpx  StdDev: %.2fpx" minMag maxMag meanMag stdDev
+
+/// Process single file in distortion visualization mode
+let processDistortionFile
+    (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool)
+    (detectionParams: DetectionParams)
+    (refStars: DetectedStar[]) (refTriangles: Triangle[])
+    (imageWidth: int) (imageHeight: int)
+    (opts: AlignOptions)
+    : Async<bool> =
+    async {
+        try
+            let fileName = Path.GetFileName(inputPath)
+            let baseName = Path.GetFileNameWithoutExtension(inputPath)
+            let outFileName = $"{baseName}{suffix}.xisf"
+            let outPath = Path.Combine(outputDir, outFileName)
+
+            if File.Exists(outPath) && not overwrite then
+                Log.Warning($"Output '{outFileName}' exists, skipping (use --overwrite)")
+                return true
+            else
+
+            // Read image
+            let reader = new XisfReader()
+            let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask
+            let img = unit.Images.[0]
+
+            let width = int img.Geometry.Width
+            let height = int img.Geometry.Height
+
+            if width <> imageWidth || height <> imageHeight then
+                Log.Error($"Image dimensions don't match reference: {fileName}")
+                return false
+            else
+
+            // Detect stars
+            let pixelFloats = PixelIO.readPixelsAsFloat img
+            let channels = int img.Geometry.ChannelCount
+            let channel0 =
+                if channels = 1 then pixelFloats
+                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+
+            let mad = calculateChannelMAD channel0
+            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let targetStars = starsResult.Stars
+
+            // Run matching
+            let config = {
+                defaultExpandingConfig with
+                    AnchorStars = opts.AnchorStars
+                    AnchorDistribution = opts.AnchorDistribution
+                    RatioTolerance = opts.RatioTolerance
+                    MinAnchorVotes = opts.MinVotes
+            }
+
+            let result = matchExpanding refStars targetStars width height config
+
+            match result.Transform with
+            | None ->
+                Log.Error($"Failed to compute transform for {fileName}")
+                return false
+            | Some transform ->
+                // Extract matched pairs
+                let inverse = invertTransform transform
+                let targetTree =
+                    targetStars
+                    |> Array.indexed
+                    |> Array.map (fun (i, s) -> (s, i))
+                    |> buildKdTree
+
+                let matchedPairs = ResizeArray<int * int>()
+                for refIdx in 0 .. refStars.Length - 1 do
+                    let refStar = refStars.[refIdx]
+                    let (predX, predY) = applyTransform inverse refStar.X refStar.Y
+                    match findNearest targetTree predX predY with
+                    | Some (_, targetIdx, dist) when dist < 15.0 ->
+                        matchedPairs.Add((refIdx, targetIdx))
+                    | _ -> ()
+
+                // Compute RBF
+                let rbfKernel =
+                    match opts.Distortion with
+                    | Wendland -> RBFTransform.Wendland 1
+                    | TPS -> RBFTransform.ThinPlateSpline
+                    | IMQ -> RBFTransform.InverseMultiquadric
+                    | NoDistortion -> RBFTransform.Wendland 1
+
+                let rbfConfig: RBFTransform.RBFConfig = {
+                    Kernel = rbfKernel
+                    SupportRadiusFactor = opts.RBFSupportFactor
+                    ShapeFactor = 0.5
+                    Regularization = opts.RBFRegularization
+                    MinControlPoints = 20
+                    MaxControlPoints = 500
+                }
+
+                let rbfResult = RBFTransform.setupRBF refStars targetStars (matchedPairs.ToArray()) transform rbfConfig width height
+
+                // Print console heatmap for analysis if requested
+                if opts.ShowDistortionStats then
+                    printDistortionHeatmap width height transform rbfResult.Coefficients 10
+
+                // Create RGB output for heatmap
+                let outputFormat = XisfSampleFormat.UInt16
+                let pixelCount = width * height
+                let pixels = Array.zeroCreate<byte> (pixelCount * 3 * 2) // RGB * UInt16
+
+                // Sample distortion at each pixel and create heatmap
+                let maxMag = 10.0 // Max distortion for color scale
+
+                Array.Parallel.iter (fun pixIdx ->
+                    let ox = pixIdx % width
+                    let oy = pixIdx / width
+
+                    let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfResult.Coefficients (float ox) (float oy) 5 0.01
+
+                    let dx = float ox - tx
+                    let dy = float oy - ty
+                    let mag = sqrt (dx * dx + dy * dy)
+
+                    let (r, g, b) = magnitudeToColor mag maxMag
+
+                    let byteIdx = pixIdx * 6
+                    // Little-endian UInt16
+                    pixels.[byteIdx] <- byte (r &&& 0xFFus)
+                    pixels.[byteIdx + 1] <- byte (r >>> 8)
+                    pixels.[byteIdx + 2] <- byte (g &&& 0xFFus)
+                    pixels.[byteIdx + 3] <- byte (g >>> 8)
+                    pixels.[byteIdx + 4] <- byte (b &&& 0xFFus)
+                    pixels.[byteIdx + 5] <- byte (b >>> 8)
+                ) [| 0 .. pixelCount - 1 |]
+
+                // Overlay control points as white circles
+                match rbfResult.Coefficients with
+                | Some coeffs ->
+                    for (cx, cy) in coeffs.ControlPoints do
+                        // Paint white circle
+                        for ch in 0 .. 2 do
+                            paintCircle pixels width height 3 ch cx cy 3.0 1.0 outputFormat
+                | None -> ()
+
+                // Create headers
+                let distName = match opts.Distortion with Wendland -> "WENDLAND" | TPS -> "TPS" | IMQ -> "IMQ" | _ -> "NONE"
+                let headers = [|
+                    XisfFitsKeyword("IMAGETYP", "DISTMAP", "Distortion visualization") :> XisfCoreElement
+                    XisfFitsKeyword("DISTCORR", distName, "Correction method") :> XisfCoreElement
+                    XisfFitsKeyword("RBFPTS", rbfResult.ControlPointCount.ToString(), "Control points") :> XisfCoreElement
+                    XisfFitsKeyword("RBFRMS", sprintf "%.3f" rbfResult.ResidualRMS, "RBF residual RMS (px)") :> XisfCoreElement
+                    XisfFitsKeyword("RBFMAX", sprintf "%.3f" rbfResult.MaxResidual, "RBF max residual (px)") :> XisfCoreElement
+                    XisfFitsKeyword("XSHIFT", sprintf "%.2f" transform.Dx, "X shift (pixels)") :> XisfCoreElement
+                    XisfFitsKeyword("YSHIFT", sprintf "%.2f" transform.Dy, "Y shift (pixels)") :> XisfCoreElement
+                    XisfFitsKeyword("ROTATION", sprintf "%.4f" transform.Rotation, "Rotation (degrees)") :> XisfCoreElement
+                    XisfFitsKeyword("HISTORY", "", "Distortion map by XisfPrep Align") :> XisfCoreElement
+                |]
+
+                // Create RGB output image
+                let geometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
+                let dataBlock = InlineDataBlock(ReadOnlyMemory(pixels), XisfEncoding.Base64)
+                let bounds = PixelIO.getBoundsForFormat outputFormat |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
+
+                let outputImage = XisfImage(
+                    geometry,
+                    outputFormat,
+                    XisfColorSpace.RGB,
+                    dataBlock,
+                    bounds,
+                    XisfPixelStorage.Normal,
+                    img.ImageType,
+                    0.0,
+                    img.Orientation,
+                    "",
+                    Nullable<Guid>(),
+                    img.Properties,
+                    headers
+                )
+
+                let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align v1.0")
+                let outUnit = XisfFactory.CreateMonolithic(metadata, outputImage)
+                let writer = new XisfWriter()
+                do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
+
+                printfn $"  {rbfResult.ControlPointCount} pts, rms={rbfResult.ResidualRMS:F2}px -> {outFileName}"
                 return true
         with ex ->
             Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
@@ -525,9 +951,10 @@ let showHelp() =
     printfn ""
     printfn "Output Mode:"
     printfn "  --output-mode <mode>      Output type (default: align)"
-    printfn "                              detect - Show detected stars only"
-    printfn "                              match  - Show matched star correspondences"
-    printfn "                              align  - Apply transformation (default)"
+    printfn "                              detect     - Show detected stars only"
+    printfn "                              match      - Show matched star correspondences"
+    printfn "                              align      - Apply transformation (default)"
+    printfn "                              distortion - Visualize distortion field"
     printfn ""
     printfn "Alignment Parameters:"
     printfn "  --interpolation <method>  Resampling method (default: lanczos3)"
@@ -556,6 +983,15 @@ let showHelp() =
     printfn $"  --max-stars-triangles <n> Stars used for triangle formation (default: {defaultMaxStarsTriangles})"
     printfn $"  --min-votes <n>           Minimum votes for valid correspondence (default: {defaultMinVotes})"
     printfn ""
+    printfn "Distortion Correction:"
+    printfn "  --distortion <type>       Correction method (default: none)"
+    printfn "                              none     - Similarity transform only"
+    printfn "                              wendland - Local RBF correction (recommended)"
+    printfn "                              tps      - Thin-plate spline (global)"
+    printfn "                              imq      - Inverse multiquadric"
+    printfn $"  --rbf-support <factor>    Wendland support radius factor (default: {defaultRBFSupportFactor})"
+    printfn $"  --rbf-regularization <v>  Regularization parameter (default: {defaultRBFRegularization})"
+    printfn ""
     printfn "Visualization (detect/match modes):"
     printfn $"  --intensity <0-1>         Marker brightness (default: {defaultIntensity})"
     printfn ""
@@ -565,6 +1001,11 @@ let showHelp() =
     printfn $"  --parallel <n>            Number of parallel operations (default: {defaultParallel} CPU cores)"
     printfn "  --output-format <format>  Output sample format (default: preserve input format)"
     printfn "                              uint8, uint16, uint32, float32, float64"
+    printfn ""
+    printfn "Diagnostic Outputs:"
+    printfn "  --show-distortion-stats   Print console heatmap in distortion mode"
+    printfn "  --include-distortion-model Output distortion heatmap alongside aligned images"
+    printfn "  --include-detection-model  Output star detection visualization alongside aligned images"
     printfn ""
     printfn "Examples:"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
@@ -589,7 +1030,8 @@ let parseArgs (args: string array) : AlignOptions =
                        | "detect" -> Detect
                        | "match" -> Match
                        | "align" -> Align
-                       | _ -> failwithf "Unknown output mode: %s (supported: detect, match, align)" value
+                       | "distortion" -> Distortion
+                       | _ -> failwithf "Unknown output mode: %s (supported: detect, match, align, distortion)" value
             parse rest { opts with OutputMode = mode }
         | "--interpolation" :: value :: rest ->
             let interp = match value.ToLower() with
@@ -646,6 +1088,26 @@ let parseArgs (args: string array) : AlignOptions =
         // Visualization
         | "--intensity" :: value :: rest ->
             parse rest { opts with Intensity = float value }
+        // Distortion correction
+        | "--distortion" :: value :: rest ->
+            let dist = match value.ToLower() with
+                       | "none" -> NoDistortion
+                       | "wendland" -> Wendland
+                       | "tps" -> TPS
+                       | "imq" -> IMQ
+                       | _ -> failwithf "Unknown distortion: %s (supported: none, wendland, tps, imq)" value
+            parse rest { opts with Distortion = dist }
+        | "--rbf-support" :: value :: rest ->
+            parse rest { opts with RBFSupportFactor = float value }
+        | "--rbf-regularization" :: value :: rest ->
+            parse rest { opts with RBFRegularization = float value }
+        // Additional outputs
+        | "--show-distortion-stats" :: rest ->
+            parse rest { opts with ShowDistortionStats = true }
+        | "--include-distortion-model" :: rest ->
+            parse rest { opts with IncludeDistortionModel = true }
+        | "--include-detection-model" :: rest ->
+            parse rest { opts with IncludeDetectionModel = true }
         | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
@@ -673,6 +1135,12 @@ let parseArgs (args: string array) : AlignOptions =
         Algorithm = defaultAlgorithm
         AnchorStars = defaultAnchorStars
         AnchorDistribution = defaultAnchorDistribution
+        Distortion = defaultDistortion
+        RBFSupportFactor = defaultRBFSupportFactor
+        RBFRegularization = defaultRBFRegularization
+        ShowDistortionStats = false
+        IncludeDistortionModel = false
+        IncludeDetectionModel = false
     }
 
     let opts = parse (List.ofArray args) defaults
@@ -696,6 +1164,8 @@ let parseArgs (args: string array) : AlignOptions =
     if opts.MinVotes < 1 then failwith "Min votes must be at least 1"
     if opts.Intensity < 0.0 || opts.Intensity > 1.0 then failwith "Intensity must be between 0 and 1"
     if opts.AnchorStars < 4 then failwith "Anchor stars must be at least 4"
+    if opts.RBFSupportFactor < 1.0 then failwith "RBF support factor must be at least 1.0"
+    if opts.RBFRegularization < 0.0 then failwith "RBF regularization must be non-negative"
 
     opts
 
@@ -875,6 +1345,34 @@ let run (args: string array) =
                     let elapsed = stopwatch.Elapsed.TotalSeconds
                     printfn ""
                     printfn $"Aligned {successCount} images, {failCount} failed in {elapsed:F1}s"
+
+                    return if failCount > 0 then 1 else 0
+
+                | Distortion ->
+                    // Distortion mode: visualize distortion field
+                    printfn "Output mode: distortion (field visualization)"
+                    printfn ""
+
+                    // Create output directory if needed
+                    if not (Directory.Exists(opts.Output)) then
+                        Directory.CreateDirectory(opts.Output) |> ignore
+                        Log.Information($"Created output directory: {opts.Output}")
+
+                    // Use _dist suffix for distortion mode
+                    let suffix = if opts.Suffix = defaultSuffix then "_dist" else opts.Suffix
+
+                    // Process all files in parallel
+                    let tasks = files |> Array.map (fun f ->
+                        processDistortionFile f opts.Output suffix opts.Overwrite detectionParams refStars refTriangles width height opts)
+                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
+
+                    let successCount = results |> Array.filter id |> Array.length
+                    let failCount = results.Length - successCount
+
+                    stopwatch.Stop()
+                    let elapsed = stopwatch.Elapsed.TotalSeconds
+                    printfn ""
+                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
 
                     return if failCount > 0 then 1 else 0
 
