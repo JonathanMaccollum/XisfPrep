@@ -11,6 +11,7 @@ open Algorithms.Statistics
 open Algorithms.OutputImage
 open Algorithms.TriangleMatch
 open Algorithms.SpatialMatch
+open Algorithms.Interpolation
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
@@ -21,10 +22,8 @@ type MatchAlgorithm =
     | Triangle   // Original triangle matching (default)
     | Expanding  // Center-seeded expanding match
 
-type InterpolationMethod =
-    | Nearest
-    | Bilinear
-    | Bicubic
+// Re-export interpolation method from Algorithms
+type InterpolationMethod = Algorithms.Interpolation.InterpolationMethod
 
 type OutputMode =
     | Detect  // Show detected stars only
@@ -32,8 +31,7 @@ type OutputMode =
     | Align   // Apply transformation (default)
 
 // --- Defaults ---
-let private defaultMaxShift = 100
-let private defaultInterpolation = Bicubic
+let private defaultInterpolation = Lanczos3
 let private defaultSuffix = "_a"
 let private defaultParallel = Environment.ProcessorCount
 // Detection defaults
@@ -61,7 +59,6 @@ type AlignOptions = {
     Reference: string option
     AutoReference: bool
     OutputMode: OutputMode
-    MaxShift: int
     Interpolation: InterpolationMethod
     Suffix: string
     Overwrite: bool
@@ -98,6 +95,48 @@ let private calculateChannelMAD (values: float[]) =
             if sorted.Length % 2 = 0 then (sorted.[mid - 1] + sorted.[mid]) / 2.0
             else sorted.[mid]
         calculateMAD values median
+
+// --- Image Transformation ---
+
+/// Transform image pixels using similarity transform and interpolation
+/// Applies inverse transform to resample target image into reference frame
+let transformImage
+    (targetPixels: float[])
+    (width: int)
+    (height: int)
+    (channels: int)
+    (transform: SimilarityTransform)
+    (interpolation: InterpolationMethod)
+    : float[] =
+
+    let inverse = invertTransform transform
+    let pixelCount = width * height
+
+    // Pre-extract channels for efficient sampling
+    let channelArrays =
+        if channels = 1 then
+            [| targetPixels |]
+        else
+            [| for ch in 0 .. channels - 1 ->
+                Array.init pixelCount (fun i -> targetPixels.[i * channels + ch]) |]
+
+    // Transform in parallel - each output pixel is independent
+    let outputPixels = Array.zeroCreate (pixelCount * channels)
+
+    Array.Parallel.iter (fun pixIdx ->
+        let ox = pixIdx % width
+        let oy = pixIdx / width
+
+        // Transform output coords to target coords
+        let (tx, ty) = applyTransform inverse (float ox) (float oy)
+
+        // Sample each channel
+        for ch in 0 .. channels - 1 do
+            let value = sample interpolation channelArrays.[ch] width height tx ty
+            outputPixels.[pixIdx * channels + ch] <- value
+    ) [| 0 .. pixelCount - 1 |]
+
+    outputPixels
 
 // --- Output Image Functions ---
 
@@ -330,6 +369,145 @@ let processMatchFile
             return false
     }
 
+/// Create FITS headers for aligned output
+let createAlignHeaders (transform: SimilarityTransform) (matchedCount: int) (refFileName: string) (interpolation: string) =
+    [|
+        XisfFitsKeyword("ALIGNED", "T", "Image has been aligned") :> XisfCoreElement
+        XisfFitsKeyword("ALIGNREF", refFileName, "Reference frame") :> XisfCoreElement
+        XisfFitsKeyword("XSHIFT", sprintf "%.2f" transform.Dx, "X shift (pixels)") :> XisfCoreElement
+        XisfFitsKeyword("YSHIFT", sprintf "%.2f" transform.Dy, "Y shift (pixels)") :> XisfCoreElement
+        XisfFitsKeyword("ROTATION", sprintf "%.4f" transform.Rotation, "Rotation (degrees)") :> XisfCoreElement
+        XisfFitsKeyword("SCALE", sprintf "%.6f" transform.Scale, "Scale factor") :> XisfCoreElement
+        XisfFitsKeyword("STARMTCH", matchedCount.ToString(), "Matched star pairs") :> XisfCoreElement
+        XisfFitsKeyword("INTERP", interpolation, "Interpolation method") :> XisfCoreElement
+        XisfFitsKeyword("HISTORY", "", "Aligned by XisfPrep Align v1.0") :> XisfCoreElement
+    |]
+
+/// Process single file in align mode - apply transformation
+let processAlignFile
+    (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool)
+    (detectionParams: DetectionParams)
+    (refStars: DetectedStar[]) (refTriangles: Triangle[])
+    (refFileName: string) (imageWidth: int) (imageHeight: int)
+    (opts: AlignOptions)
+    : Async<bool> =
+    async {
+        try
+            let fileName = Path.GetFileName(inputPath)
+            let baseName = Path.GetFileNameWithoutExtension(inputPath)
+            let outFileName = $"{baseName}{suffix}.xisf"
+            let outPath = Path.Combine(outputDir, outFileName)
+
+            if File.Exists(outPath) && not overwrite then
+                Log.Warning($"Output '{outFileName}' exists, skipping (use --overwrite)")
+                return true
+            else
+
+            // Read image
+            let reader = new XisfReader()
+            let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask
+            let img = unit.Images.[0]
+
+            let width = int img.Geometry.Width
+            let height = int img.Geometry.Height
+            let channels = int img.Geometry.ChannelCount
+
+            // Verify dimensions match reference
+            if width <> imageWidth || height <> imageHeight then
+                Log.Error($"Image dimensions {width}x{height} don't match reference {imageWidth}x{imageHeight}: {fileName}")
+                return false
+            else
+
+            // Get pixel data and detect stars
+            let pixelFloats = PixelIO.readPixelsAsFloat img
+            let channel0 =
+                if channels = 1 then pixelFloats
+                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+
+            let mad = calculateChannelMAD channel0
+            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let targetStars = starsResult.Stars
+
+            // Run matching based on selected algorithm
+            let matchResult =
+                match opts.Algorithm with
+                | Triangle ->
+                    // Use triangle matching
+                    let targetTriangles = formTriangles targetStars opts.MaxStarsTriangles
+                    let matches = matchTriangles refTriangles targetTriangles opts.RatioTolerance
+                    let correspondences = voteForCorrespondences matches
+                    let sortedVotes = correspondences |> Map.toArray |> Array.sortByDescending snd
+
+                    // Build pairs for transform estimation
+                    let aboveThreshold = sortedVotes |> Array.filter (fun (_, v) -> v >= opts.MinVotes)
+                    let bestPerRef =
+                        aboveThreshold
+                        |> Array.groupBy (fun ((refIdx, _), _) -> refIdx)
+                        |> Array.map (fun (_, group) -> group |> Array.maxBy snd)
+                    let bijective =
+                        bestPerRef
+                        |> Array.groupBy (fun ((_, targetIdx), _) -> targetIdx)
+                        |> Array.map (fun (_, group) -> group |> Array.maxBy snd)
+
+                    let pairs =
+                        bijective
+                        |> Array.map (fun ((refIdx, targetIdx), _) ->
+                            let r = refStars.[refIdx]
+                            let t = targetStars.[targetIdx]
+                            (r.X, r.Y, t.X, t.Y))
+
+                    match estimateTransformFromPairs pairs with
+                    | Some t -> Some (t, bijective.Length)
+                    | None -> None
+
+                | Expanding ->
+                    // Use expanding match algorithm
+                    let config = {
+                        defaultExpandingConfig with
+                            AnchorStars = opts.AnchorStars
+                            AnchorDistribution = opts.AnchorDistribution
+                            RatioTolerance = opts.RatioTolerance
+                            MinAnchorVotes = opts.MinVotes
+                    }
+
+                    let result = matchExpanding refStars targetStars width height config
+                    result.Transform |> Option.map (fun t -> (t, result.TotalInliers))
+
+            match matchResult with
+            | None ->
+                Log.Error($"Failed to compute transform for {fileName}")
+                return false
+            | Some (transform, matchedCount) ->
+                // Apply transformation
+                let transformedPixels = transformImage pixelFloats width height channels transform opts.Interpolation
+
+                // Output as float32 for interpolation precision
+                // normalize=true converts [0, 65535] → [0, 1] for Float32
+                let outputFormat = XisfSampleFormat.Float32
+                let outputBytes = PixelIO.writePixelsFromFloat transformedPixels outputFormat true
+
+                // Get interpolation name for header
+                let interpName =
+                    match opts.Interpolation with
+                    | Nearest -> "nearest"
+                    | Bilinear -> "bilinear"
+                    | Bicubic -> "bicubic"
+                    | Lanczos3 -> "lanczos3"
+
+                let headers = createAlignHeaders transform matchedCount refFileName interpName
+                let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
+                let outputImage = createOutputImage img outputBytes outputFormat headers inPlaceKeys
+
+                do! writeOutputFile outPath outputImage "XisfPrep Align v1.0"
+
+                // Tidy output: dx=1.2 dy=-0.8 rot=0.12° -> filename_a.xisf
+                printfn $"  dx={transform.Dx:F1} dy={transform.Dy:F1} rot={transform.Rotation:F2}° -> {outFileName}"
+                return true
+        with ex ->
+            Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
+            return false
+    }
+
 // ---
 
 let showHelp() =
@@ -352,11 +530,11 @@ let showHelp() =
     printfn "                              align  - Apply transformation (default)"
     printfn ""
     printfn "Alignment Parameters:"
-    printfn $"  --max-shift <pixels>      Maximum pixel shift allowed (default: {defaultMaxShift})"
-    printfn "  --interpolation <method>  Resampling method (default: bicubic)"
+    printfn "  --interpolation <method>  Resampling method (default: lanczos3)"
     printfn "                              nearest  - Nearest neighbor (preserves values)"
     printfn "                              bilinear - Bilinear (smooth, fast)"
-    printfn "                              bicubic  - Bicubic (smooth, higher quality)"
+    printfn "                              bicubic  - Bicubic (4x4 Catmull-Rom)"
+    printfn "                              lanczos3 - Lanczos (6x6, best quality)"
     printfn ""
     printfn "Detection Parameters:"
     printfn $"  --threshold <sigma>       Detection threshold in sigma (default: {defaultThreshold})"
@@ -390,7 +568,7 @@ let showHelp() =
     printfn ""
     printfn "Examples:"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\" --max-shift 50"
+    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\""
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode detect"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode match --intensity 0.8"
 
@@ -413,14 +591,13 @@ let parseArgs (args: string array) : AlignOptions =
                        | "align" -> Align
                        | _ -> failwithf "Unknown output mode: %s (supported: detect, match, align)" value
             parse rest { opts with OutputMode = mode }
-        | "--max-shift" :: value :: rest ->
-            parse rest { opts with MaxShift = int value }
         | "--interpolation" :: value :: rest ->
             let interp = match value.ToLower() with
                          | "nearest" -> Nearest
                          | "bilinear" -> Bilinear
                          | "bicubic" -> Bicubic
-                         | _ -> failwithf "Unknown interpolation method: %s (supported: nearest, bilinear, bicubic)" value
+                         | "lanczos" | "lanczos3" -> Lanczos3
+                         | _ -> failwithf "Unknown interpolation method: %s (supported: nearest, bilinear, bicubic, lanczos3)" value
             parse rest { opts with Interpolation = interp }
         | "--suffix" :: value :: rest ->
             parse rest { opts with Suffix = value }
@@ -478,7 +655,6 @@ let parseArgs (args: string array) : AlignOptions =
         Reference = None
         AutoReference = false
         OutputMode = Align
-        MaxShift = defaultMaxShift
         Interpolation = defaultInterpolation
         Suffix = defaultSuffix
         Overwrite = false
@@ -508,7 +684,6 @@ let parseArgs (args: string array) : AlignOptions =
     if opts.Reference.IsSome && opts.AutoReference then
         failwith "--reference and --auto-reference are mutually exclusive"
 
-    if opts.MaxShift < 1 then failwith "Max shift must be at least 1 pixel"
     if opts.MaxParallel < 1 then failwith "Parallel count must be at least 1"
     if opts.Threshold <= 0.0 then failwith "Threshold must be positive"
     if opts.GridSize < 16 then failwith "Grid size must be at least 16"
@@ -677,9 +852,31 @@ let run (args: string array) =
                     return if failCount > 0 then 1 else 0
 
                 | Align ->
-                    // Align mode: apply transformation (not yet implemented)
-                    Log.Error("Align output mode not yet implemented. Use --output-mode match for triangle matching analysis.")
-                    return 1
+                    // Align mode: apply transformation
+                    printfn "Output mode: align (image transformation)"
+                    printfn ""
+
+                    // Create output directory if needed
+                    if not (Directory.Exists(opts.Output)) then
+                        Directory.CreateDirectory(opts.Output) |> ignore
+                        Log.Information($"Created output directory: {opts.Output}")
+
+                    let refFileName = Path.GetFileName(referenceFile)
+
+                    // Process all files in parallel
+                    let tasks = files |> Array.map (fun f ->
+                        processAlignFile f opts.Output opts.Suffix opts.Overwrite detectionParams refStars refTriangles refFileName width height opts)
+                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
+
+                    let successCount = results |> Array.filter id |> Array.length
+                    let failCount = results.Length - successCount
+
+                    stopwatch.Stop()
+                    let elapsed = stopwatch.Elapsed.TotalSeconds
+                    printfn ""
+                    printfn $"Aligned {successCount} images, {failCount} failed in {elapsed:F1}s"
+
+                    return if failCount > 0 then 1 else 0
 
             with ex ->
                 Log.Error($"Error: {ex.Message}")
