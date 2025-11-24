@@ -32,7 +32,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\XisfLib.Core\XisfLib.Core.csproj" />
+    <PackageReference Include="XisfLib.Core" Version="1.*" />
   </ItemGroup>
 
 </Project>
