@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            artifact: xisfprep-win-x64.exe
+          - os: ubuntu-latest
+            rid: linux-x64
+            artifact: xisfprep-linux-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish
+        run: |
+          dotnet publish -c Release -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=true -p:PublishReadyToRun=true -o publish
+
+      - name: Rename artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: mv publish/XisfPrep.exe publish/${{ matrix.artifact }}
+
+      - name: Rename artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: mv publish/XisfPrep publish/${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: publish/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/xisfprep-win-x64.exe/xisfprep-win-x64.exe
+            artifacts/xisfprep-linux-x64/xisfprep-linux-x64
+          generate_release_notes: true
