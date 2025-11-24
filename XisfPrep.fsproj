@@ -11,6 +11,8 @@
     <Compile Include="Algorithms\Painting.fs" />
     <Compile Include="Algorithms\OutputImage.fs" />
     <Compile Include="Algorithms\StarDetection.fs" />
+    <Compile Include="Algorithms\SpatialMatch.fs" />
+    <Compile Include="Algorithms\TriangleMatch.fs" />
     <Compile Include="Commands\Calibrate.fs" />
     <Compile Include="Commands\Debayer.fs" />
     <Compile Include="Commands\Headers.fs" />

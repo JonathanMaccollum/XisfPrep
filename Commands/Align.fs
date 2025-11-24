@@ -1,6 +1,7 @@
 module Commands.Align
 
 open System
+open System.Diagnostics
 open System.IO
 open Serilog
 open XisfLib.Core
@@ -8,10 +9,17 @@ open Algorithms
 open Algorithms.Painting
 open Algorithms.Statistics
 open Algorithms.OutputImage
+open Algorithms.TriangleMatch
+open Algorithms.SpatialMatch
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
 type DetectionParams = Algorithms.StarDetection.DetectionParams
+
+// Algorithm selection
+type MatchAlgorithm =
+    | Triangle   // Original triangle matching (default)
+    | Expanding  // Center-seeded expanding match
 
 type InterpolationMethod =
     | Nearest
@@ -41,6 +49,10 @@ let private defaultMaxStarsTriangles = 100
 let private defaultMinVotes = 3
 // Visualization defaults
 let private defaultIntensity = 1.0
+// Algorithm defaults
+let private defaultAlgorithm = Expanding
+let private defaultAnchorStars = 12
+let private defaultAnchorDistribution = SpatialMatch.Center
 // ---
 
 type AlignOptions = {
@@ -68,285 +80,11 @@ type AlignOptions = {
     MinVotes: int
     // Visualization
     Intensity: float
+    // Algorithm selection
+    Algorithm: MatchAlgorithm
+    AnchorStars: int
+    AnchorDistribution: SpatialMatch.AnchorDistribution
 }
-
-// --- Triangle Matching Types ---
-
-type Triangle = {
-    /// Indices into the ORIGINAL star array, sorted geometrically:
-    /// [0] = Vertex opposite Side A (Shortest side)
-    /// [1] = Vertex opposite Side B (Middle side)
-    /// [2] = Vertex opposite Side C (Longest side)
-    Vertices: int[] 
-    
-    /// Side lengths sorted ascending (scale-invariant descriptor)
-    SideA: float  // shortest
-    SideB: float  // middle
-    SideC: float  // longest
-    /// Ratios for matching (rotation and scale invariant)
-    RatioAB: float  // SideA / SideB
-    RatioBC: float  // SideB / SideC
-}
-
-type TriangleMatch = {
-    RefTriangle: Triangle
-    TargetTriangle: Triangle
-    RatioError: float  // Combined error in ratios
-}
-
-type AlignmentDiagnostics = {
-    FileName: string
-    DetectedStars: int
-    TrianglesFormed: int
-    TrianglesMatched: int
-    MatchPercentage: float
-    TopVoteCount: int
-    EstimatedTransform: (float * float * float * float) option  // dx, dy, rotation, scale
-}
-
-// --- Triangle Matching Algorithm ---
-
-/// Form triangles from the brightest N stars
-/// Returns triangles with scale/rotation invariant descriptors
-let formTriangles (stars: DetectedStar[]) (maxStars: int) : Triangle[] =
-    // 1. Preserve ORIGINAL indices by pairing them before sorting/filtering
-    let topStarsWithIndices =
-        stars
-        |> Array.indexed // Creates (originalIndex, Star) tuple
-        |> Array.sortByDescending (fun (_, s) -> s.Flux)
-        |> Array.truncate maxStars
-
-    let n = topStarsWithIndices.Length
-    if n < 3 then [||]
-    else
-        let triangles = ResizeArray<Triangle>()
-
-        // Form all possible triangles (n choose 3)
-        for i in 0 .. n - 3 do
-            for j in i + 1 .. n - 2 do
-                for k in j + 1 .. n - 1 do
-                    // Extract original indices and star objects
-                    let (idx1, s1) = topStarsWithIndices.[i]
-                    let (idx2, s2) = topStarsWithIndices.[j]
-                    let (idx3, s3) = topStarsWithIndices.[k]
-
-                    // Calculate side lengths
-                    let d12 = sqrt ((s1.X - s2.X) ** 2.0 + (s1.Y - s2.Y) ** 2.0)
-                    let d23 = sqrt ((s2.X - s3.X) ** 2.0 + (s2.Y - s3.Y) ** 2.0)
-                    let d31 = sqrt ((s3.X - s1.X) ** 2.0 + (s3.Y - s1.Y) ** 2.0)
-
-                    // Create array of (Length, OppositeVertexOriginalIndex)
-                    // d12 connects 1-2, so opposite is 3
-                    // d23 connects 2-3, so opposite is 1
-                    // d31 connects 3-1, so opposite is 2
-                    let rawSides : (float * int)[] = 
-                        [| (d12, idx3); (d23, idx1); (d31, idx2) |]
-
-                    // Sort by length (ascending) to establish geometry
-                    // Array.sortBy fst automatically uses the float length for sorting
-                    let sortedSides = rawSides |> Array.sortBy fst
-
-                    let sideA = fst sortedSides.[0] // Shortest
-                    let sideB = fst sortedSides.[1] // Middle
-                    let sideC = fst sortedSides.[2] // Longest
-
-                    // Extract the vertices in geometric order (Opposite Shortest, Opposite Middle, Opposite Longest)
-                    let orderedVertices = 
-                        [| snd sortedSides.[0]; snd sortedSides.[1]; snd sortedSides.[2] |]
-
-                    // Skip degenerate triangles
-                    if sideA > 5.0 && sideC > 0.0 then
-                        let ratioAB = sideA / sideB
-                        let ratioBC = sideB / sideC
-
-                        triangles.Add {
-                            Vertices = orderedVertices
-                            SideA = sideA
-                            SideB = sideB
-                            SideC = sideC
-                            RatioAB = ratioAB
-                            RatioBC = ratioBC
-                        }
-
-        triangles.ToArray()
-
-/// Match triangles between reference and target by ratio similarity
-let matchTriangles (refTriangles: Triangle[]) (targetTriangles: Triangle[]) (tolerance: float) : TriangleMatch[] =
-    let matches = ResizeArray<TriangleMatch>()
-
-    for refTri in refTriangles do
-        for targetTri in targetTriangles do
-            // Compare ratios (scale and rotation invariant)
-            let errorAB = abs (refTri.RatioAB - targetTri.RatioAB)
-            let errorBC = abs (refTri.RatioBC - targetTri.RatioBC)
-            let totalError = errorAB + errorBC
-
-            if totalError < tolerance then
-                matches.Add {
-                    RefTriangle = refTri
-                    TargetTriangle = targetTri
-                    RatioError = totalError
-                }
-
-    matches.ToArray()
-
-/// Vote for star correspondences from triangle matches
-/// Returns map of (refStarIdx, targetStarIdx) -> vote count
-let voteForCorrespondences (matches: TriangleMatch[]) : Map<(int * int), int> =
-    let votes = System.Collections.Generic.Dictionary<(int * int), int>()
-
-    for m in matches do
-        // Since Vertices are sorted geometrically (Opposite Shortest, Opposite Middle, Opposite Longest),
-        // we can map them directly index-to-index.
-        for i in 0 .. 2 do
-            let refIdx = m.RefTriangle.Vertices.[i]
-            let targetIdx = m.TargetTriangle.Vertices.[i]
-            let pair = (refIdx, targetIdx)
-            
-            if votes.ContainsKey pair then
-                votes.[pair] <- votes.[pair] + 1
-            else
-                votes.[pair] <- 1
-
-    votes |> Seq.map (fun kvp -> (kvp.Key, kvp.Value)) |> Map.ofSeq
-
-/// Estimate similarity transform from matched star pairs using least squares
-/// Returns (dx, dy, rotation in degrees, scale)
-let estimateTransform
-    (refStars: DetectedStar[])
-    (targetStars: DetectedStar[])
-    (correspondences: ((int * int) * int)[])
-    (minVotes: int)
-    : (float * float * float * float) option =
-
-    // Filter by vote count
-    let aboveThreshold =
-        correspondences |> Array.filter (fun (_, votes) -> votes >= minVotes)
-
-    // Select best target for each reference star (highest votes)
-    let bestPerRef =
-        aboveThreshold
-        |> Array.groupBy (fun ((refIdx, _), _) -> refIdx)
-        |> Array.map (fun (_, group) ->
-            group |> Array.maxBy (fun (_, votes) -> votes))
-
-    // Also ensure each target is used only once (full bijective mapping)
-    let filteredCorrespondences =
-        bestPerRef
-        |> Array.groupBy (fun ((_, targetIdx), _) -> targetIdx)
-        |> Array.map (fun (_, group) ->
-            group |> Array.maxBy (fun (_, votes) -> votes))
-
-    // Debug: log first few correspondences
-    for i in 0 .. min 4 (filteredCorrespondences.Length - 1) do
-        let ((refIdx, targetIdx), votes) = filteredCorrespondences.[i]
-        let r = refStars.[refIdx]
-        let t = targetStars.[targetIdx]
-        Log.Verbose("Pair {I}: Ref[{RefIdx}]=({RefX:F1},{RefY:F1}) -> Target[{TargetIdx}]=({TargetX:F1},{TargetY:F1}) votes={Votes}",
-            i, refIdx, r.X, r.Y, targetIdx, t.X, t.Y, votes)
-
-    let pairs =
-        filteredCorrespondences
-        |> Array.map (fun ((refIdx, targetIdx), _) ->
-            let r = refStars.[refIdx]
-            let t = targetStars.[targetIdx]
-            (r.X, r.Y, t.X, t.Y))
-
-    // Debug: count pairs with matching vs mismatching coordinates
-    let matchingCount = pairs |> Array.filter (fun (rx, ry, tx, ty) ->
-        abs(rx - tx) < 0.1 && abs(ry - ty) < 0.1) |> Array.length
-    Log.Verbose("Total pairs for transform: {Count} ({Matching} with matching coords)",
-        pairs.Length, matchingCount)
-
-    if pairs.Length < 2 then None
-    else
-        // Solve for similarity transform:
-        // Rx = a*Tx - b*Ty + dx
-        // Ry = b*Tx + a*Ty + dy
-        // Where scale = sqrt(a² + b²), rotation = atan2(b, a)
-
-        let n = float pairs.Length
-
-        // T = Target (x, y), R = Reference (rx, ry)
-        let sumTx = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx)
-        let sumTy = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty)
-        let sumRx = pairs |> Array.sumBy (fun (rx, _, _, _) -> rx)
-        let sumRy = pairs |> Array.sumBy (fun (_, ry, _, _) -> ry)
-
-        let sumTxRx = pairs |> Array.sumBy (fun (rx, _, tx, _) -> tx * rx)
-        let sumTyRy = pairs |> Array.sumBy (fun (_, ry, _, ty) -> ty * ry)
-        
-        let sumTxRy = pairs |> Array.sumBy (fun (_, ry, tx, _) -> tx * ry)
-        let sumTyRx = pairs |> Array.sumBy (fun (rx, _, _, ty) -> ty * rx)
-
-        let sumTx2 = pairs |> Array.sumBy (fun (_, _, tx, _) -> tx * tx)
-        let sumTy2 = pairs |> Array.sumBy (fun (_, _, _, ty) -> ty * ty)
-
-        // Denominator
-        let denom = n * (sumTx2 + sumTy2) - sumTx * sumTx - sumTy * sumTy
-
-        Log.Verbose("Sums: n={N} sumTx={SumTx:F1} sumTy={SumTy:F1} sumRx={SumRx:F1} sumRy={SumRy:F1}",
-            n, sumTx, sumTy, sumRx, sumRy)
-        Log.Verbose("Cross: sumTxRx={TxRx:F1} sumTyRy={TyRy:F1} sumTxRy={TxRy:F1} sumTyRx={TyRx:F1}",
-            sumTxRx, sumTyRy, sumTxRy, sumTyRx)
-        Log.Verbose("Denom={Denom:F1}", denom)
-
-        if abs denom < 1e-10 then None
-        else
-            let a = (n * (sumTxRx + sumTyRy) - sumTx * sumRx - sumTy * sumRy) / denom
-            let b = (n * (sumTxRy - sumTyRx) - sumTx * sumRy + sumTy * sumRx) / denom // Corrected sign
-
-            let dx = (sumRx - a * sumTx + b * sumTy) / n
-            let dy = (sumRy - b * sumTx - a * sumTy) / n
-
-            let scale = sqrt (a * a + b * b)
-            let rotation = atan2 b a * 180.0 / Math.PI
-
-            Log.Verbose("Transform: a={A:F4} b={B:F4} dx={Dx:F2} dy={Dy:F2} rot={Rot:F2}° scale={Scale:F4}",
-                a, b, dx, dy, rotation, scale)
-
-            Some (dx, dy, rotation, scale)
-
-/// Run diagnostic analysis on a target image against reference
-let runDiagnostic
-    (refStars: DetectedStar[])
-    (refTriangles: Triangle[])
-    (targetStars: DetectedStar[])
-    (fileName: string)
-    (ratioTolerance: float)
-    (maxStarsForTriangles: int)
-    (minVotes: int)
-    : AlignmentDiagnostics =
-
-    let targetTriangles = formTriangles targetStars maxStarsForTriangles
-    let matches = matchTriangles refTriangles targetTriangles ratioTolerance
-
-    let correspondences = voteForCorrespondences matches
-    let sortedVotes =
-        correspondences
-        |> Map.toArray
-        |> Array.sortByDescending snd
-
-    let topVoteCount =
-        if sortedVotes.Length > 0 then snd sortedVotes.[0]
-        else 0
-
-    let transform = estimateTransform refStars targetStars sortedVotes minVotes
-
-    let matchPercentage =
-        if refTriangles.Length > 0 then
-            (float matches.Length / float refTriangles.Length) * 100.0
-        else 0.0
-
-    {
-        FileName = fileName
-        DetectedStars = targetStars.Length
-        TrianglesFormed = targetTriangles.Length
-        TrianglesMatched = matches.Length
-        MatchPercentage = matchPercentage
-        TopVoteCount = topVoteCount
-        EstimatedTransform = transform
-    }
 
 // --- Helper Functions ---
 
@@ -514,21 +252,55 @@ let processMatchFile
             let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
             let targetStars = starsResult.Stars
 
-            // Run matching
-            let diag = runDiagnostic refStars refTriangles targetStars fileName opts.RatioTolerance opts.MaxStarsTriangles opts.MinVotes
+            // Run matching based on selected algorithm
+            let (diag, matchedTargetIndices) =
+                match opts.Algorithm with
+                | Triangle ->
+                    // Original triangle matching
+                    let diag = runDiagnostic refStars refTriangles targetStars fileName opts.RatioTolerance opts.MaxStarsTriangles opts.MinVotes
 
-            // Get matched target star indices from correspondences
-            let targetTriangles = formTriangles targetStars opts.MaxStarsTriangles
-            let matches = matchTriangles refTriangles targetTriangles opts.RatioTolerance
-            let correspondences = voteForCorrespondences matches
+                    // Get matched target star indices from correspondences
+                    let targetTriangles = formTriangles targetStars opts.MaxStarsTriangles
+                    let matches = matchTriangles refTriangles targetTriangles opts.RatioTolerance
+                    let correspondences = voteForCorrespondences matches
 
-            // Target stars that have enough votes are considered matched
-            let matchedTargetIndices =
-                correspondences
-                |> Map.toSeq
-                |> Seq.filter (fun ((_, _), votes) -> votes >= opts.MinVotes)
-                |> Seq.map (fun ((_, targetIdx), _) -> targetIdx)
-                |> Set.ofSeq
+                    let matchedIndices =
+                        correspondences
+                        |> Map.toSeq
+                        |> Seq.filter (fun ((_, _), votes) -> votes >= opts.MinVotes)
+                        |> Seq.map (fun ((_, targetIdx), _) -> targetIdx)
+                        |> Set.ofSeq
+
+                    (diag, matchedIndices)
+
+                | Expanding ->
+                    // Center-seeded expanding match
+                    let config = {
+                        defaultExpandingConfig with
+                            AnchorStars = opts.AnchorStars
+                            AnchorDistribution = opts.AnchorDistribution
+                            RatioTolerance = opts.RatioTolerance
+                            MinAnchorVotes = opts.MinVotes
+                    }
+
+                    let result = matchExpanding refStars targetStars width height config
+
+                    // Convert to diagnostics format
+                    let transform =
+                        result.Transform
+                        |> Option.map (fun t -> (t.Dx, t.Dy, t.Rotation, t.Scale))
+
+                    let diag = {
+                        FileName = fileName
+                        DetectedStars = targetStars.Length
+                        TrianglesFormed = 0  // Not applicable
+                        TrianglesMatched = result.AnchorPairs
+                        MatchPercentage = 0.0
+                        TopVoteCount = result.TotalInliers
+                        EstimatedTransform = transform
+                    }
+
+                    (diag, result.MatchedTargetIndices)
 
             let matchedCount = matchedTargetIndices.Count
             let unmatchedCount = targetStars.Length - matchedCount
@@ -547,10 +319,11 @@ let processMatchFile
             // Format transform info for output
             let transformStr =
                 match diag.EstimatedTransform with
-                | Some (dx, dy, rot, scale) -> sprintf "dx=%.1f dy=%.1f rot=%.2f°" dx dy rot
+                | Some (dx, dy, rot, _) -> sprintf "dx=%.1f dy=%.1f rot=%.2f°" dx dy rot
                 | None -> "N/A"
 
-            printfn $"  {matchedCount}/{targetStars.Length} matched -> {outFileName} ({transformStr})"
+            let algoStr = match opts.Algorithm with Triangle -> "" | Expanding -> " [exp]"
+            printfn $"  {matchedCount}/{targetStars.Length} matched -> {outFileName} ({transformStr}){algoStr}"
             return true
         with ex ->
             Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
@@ -594,6 +367,13 @@ let showHelp() =
     printfn $"  --max-stars <n>           Maximum stars to detect (default: {defaultMaxStars})"
     printfn ""
     printfn "Matching Parameters:"
+    printfn "  --algorithm <type>        Matching algorithm (default: expanding)"
+    printfn "                              triangle  - Triangle ratio matching"
+    printfn "                              expanding - Center-seeded expanding match"
+    printfn $"  --anchor-stars <n>        Anchor stars for expanding algorithm (default: {defaultAnchorStars})"
+    printfn "  --anchor-spread <type>    Anchor distribution (default: center)"
+    printfn "                              center - Central region only"
+    printfn "                              grid   - Distributed across 3x3 grid"
     printfn $"  --ratio-tolerance <val>   Triangle ratio matching tolerance (default: {defaultRatioTolerance})"
     printfn $"  --max-stars-triangles <n> Stars used for triangle formation (default: {defaultMaxStarsTriangles})"
     printfn $"  --min-votes <n>           Minimum votes for valid correspondence (default: {defaultMinVotes})"
@@ -666,6 +446,20 @@ let parseArgs (args: string array) : AlignOptions =
         | "--max-stars" :: value :: rest ->
             parse rest { opts with MaxStars = int value }
         // Matching parameters
+        | "--algorithm" :: value :: rest ->
+            let algo = match value.ToLower() with
+                       | "triangle" -> Triangle
+                       | "expanding" -> Expanding
+                       | _ -> failwithf "Unknown algorithm: %s (supported: triangle, expanding)" value
+            parse rest { opts with Algorithm = algo }
+        | "--anchor-stars" :: value :: rest ->
+            parse rest { opts with AnchorStars = int value }
+        | "--anchor-spread" :: value :: rest ->
+            let dist = match value.ToLower() with
+                       | "center" -> SpatialMatch.Center
+                       | "grid" -> SpatialMatch.Grid
+                       | _ -> failwithf "Unknown anchor spread: %s (supported: center, grid)" value
+            parse rest { opts with AnchorDistribution = dist }
         | "--ratio-tolerance" :: value :: rest ->
             parse rest { opts with RatioTolerance = float value }
         | "--max-stars-triangles" :: value :: rest ->
@@ -700,6 +494,9 @@ let parseArgs (args: string array) : AlignOptions =
         MaxStarsTriangles = defaultMaxStarsTriangles
         MinVotes = defaultMinVotes
         Intensity = defaultIntensity
+        Algorithm = defaultAlgorithm
+        AnchorStars = defaultAnchorStars
+        AnchorDistribution = defaultAnchorDistribution
     }
 
     let opts = parse (List.ofArray args) defaults
@@ -723,6 +520,7 @@ let parseArgs (args: string array) : AlignOptions =
     if opts.MaxStarsTriangles < 3 then failwith "Max stars for triangles must be at least 3"
     if opts.MinVotes < 1 then failwith "Min votes must be at least 1"
     if opts.Intensity < 0.0 || opts.Intensity > 1.0 then failwith "Intensity must be between 0 and 1"
+    if opts.AnchorStars < 4 then failwith "Anchor stars must be at least 4"
 
     opts
 
@@ -755,6 +553,8 @@ let run (args: string array) =
                 else
 
                 printfn $"Found {files.Length} files"
+
+                let stopwatch = Stopwatch.StartNew()
 
                 // Determine reference
                 let referenceFile =
@@ -841,8 +641,10 @@ let run (args: string array) =
                     let successCount = results |> Array.filter id |> Array.length
                     let failCount = results.Length - successCount
 
+                    stopwatch.Stop()
+                    let elapsed = stopwatch.Elapsed.TotalSeconds
                     printfn ""
-                    printfn $"Completed: {successCount} succeeded, {failCount} failed"
+                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
 
                     return if failCount > 0 then 1 else 0
 
@@ -867,8 +669,10 @@ let run (args: string array) =
                     let successCount = results |> Array.filter id |> Array.length
                     let failCount = results.Length - successCount
 
+                    stopwatch.Stop()
+                    let elapsed = stopwatch.Elapsed.TotalSeconds
                     printfn ""
-                    printfn $"Completed: {successCount} succeeded, {failCount} failed"
+                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
 
                     return if failCount > 0 then 1 else 0
 
