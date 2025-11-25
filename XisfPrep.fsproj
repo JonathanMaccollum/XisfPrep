@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="PixelIO.fs" />
     <Compile Include="Algorithms\Statistics.fs" />
+    <Compile Include="Algorithms\Calibration.fs" />
     <Compile Include="Algorithms\Painting.fs" />
     <Compile Include="Algorithms\OutputImage.fs" />
     <Compile Include="Algorithms\StarDetection.fs" />

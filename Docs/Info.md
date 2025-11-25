@@ -306,16 +306,70 @@ xisfprep align --input "images/*.xisf" --output "aligned/" \
   - Creates `_det.xisf` file showing matched/unmatched stars
   - Useful for validating star detection quality
 
+**Calibration (Applied Before Star Detection):**
+
+Calibration frames can be applied to raw lights during alignment for a streamlined workflow. Calibration happens **before** star detection to ensure clean pixel data.
+
+- `--bias, -b <file>` - Master bias frame path
+- `--bias-level <value>` - Constant bias value (alternative to `--bias`)
+- `--dark, -d <file>` - Master dark frame path
+- `--flat, -f <file>` - Master flat frame path
+- `--uncalibrated-dark` - Dark frame is raw/uncalibrated (not bias-subtracted)
+- `--uncalibrated-flat` - Flat frame is raw/uncalibrated (not bias/dark-subtracted)
+- `--optimize-dark` - Optimize dark scaling for temperature/exposure differences
+  - Requires: `--uncalibrated-dark`, `--bias` or `--bias-level`
+  - Automatically scales dark current based on exposure time and temperature
+- `--pedestal <value>` - Output pedestal [0-65535] (default: 0)
+  - Adds constant offset to prevent negative values after calibration
+
+**Calibration Algorithm:**
+```
+Output = ((Light - Bias - Dark) / Flat) + Pedestal
+```
+
+**Master Frame State Assumptions:**
+- Default: Masters are pre-calibrated (bias/dark already subtracted from flat)
+- Use `--uncalibrated-dark` if dark is raw (only bias will be subtracted before using)
+- Use `--uncalibrated-flat` if flat is raw (bias and dark will be subtracted before division)
+
+**Calibration Examples:**
+```bash
+# Full calibration with pre-calibrated masters (standard workflow)
+xisfprep align -i "lights/*.xisf" -o "aligned/" \
+  --bias bias.xisf --dark dark.xisf --flat flat.xisf \
+  --distortion wendland
+
+# Using constant bias level instead of frame
+xisfprep align -i "lights/*.xisf" -o "aligned/" \
+  --bias-level 500 --dark dark.xisf --flat flat.xisf
+
+# With dark optimization for temperature differences
+xisfprep align -i "lights/*.xisf" -o "aligned/" \
+  --bias bias.xisf --dark dark_raw.xisf --flat flat.xisf \
+  --uncalibrated-dark --optimize-dark
+
+# Calibrate + align + distortion correction in one step
+xisfprep align -i "lights/*.xisf" -o "aligned/" \
+  --bias bias.xisf --dark dark.xisf --flat flat.xisf \
+  --distortion wendland --anchor-stars 20 \
+  --include-distortion-model --include-detection-model
+```
+
 **Process (Expanding Algorithm - Default):**
-1. Detect stars in reference frame
-2. Select anchor stars from center (or grid) in reference and target
-3. Form triangles from anchor stars
-4. Match triangles by ratio similarity and vote for correspondences
-5. Estimate initial similarity transform from anchor matches
-6. Propagate matches using KD-tree spatial lookups
-7. Refine transform with RANSAC outlier rejection
-8. Re-propagate with tighter radius for final refinement
-9. Apply transform based on output mode
+1. Load master calibration frames (if provided)
+2. Calibrate reference frame pixels (if masters loaded)
+3. Detect stars in (calibrated) reference frame
+4. For each target frame:
+   a. Calibrate target frame pixels (if masters loaded)
+   b. Detect stars in (calibrated) target frame
+   c. Select anchor stars from center (or grid) in reference and target
+   d. Form triangles from anchor stars
+   e. Match triangles by ratio similarity and vote for correspondences
+   f. Estimate initial similarity transform from anchor matches
+   g. Propagate matches using KD-tree spatial lookups
+   h. Refine transform with RANSAC outlier rejection
+   i. Re-propagate with tighter radius for final refinement
+   j. Apply transform and write output
 
 **Process (Triangle Algorithm - Legacy):**
 1. Detect stars in reference frame

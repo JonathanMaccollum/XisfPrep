@@ -13,6 +13,7 @@ open Algorithms.TriangleMatch
 open Algorithms.SpatialMatch
 open Algorithms.Interpolation
 open Algorithms.RBFTransform
+open Algorithms.Calibration
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
@@ -101,9 +102,27 @@ type AlignOptions = {
     ShowDistortionStats: bool
     IncludeDistortionModel: bool
     IncludeDetectionModel: bool
+    // Calibration
+    BiasFrame: string option
+    BiasLevel: float option
+    DarkFrame: string option
+    FlatFrame: string option
+    UncalibratedDark: bool
+    UncalibratedFlat: bool
+    OptimizeDark: bool
+    OutputPedestal: int
 }
 
 // --- Helper Functions ---
+
+/// Apply calibration if masters available
+let private applyCalibration (pixelsRaw: float[]) (masters: (MasterFrames * CalibrationConfig) option) : float[] =
+    match masters with
+    | Some (m, calConfig) ->
+        let result = calibratePixels pixelsRaw m calConfig
+        result.CalibratedPixels
+    | None ->
+        pixelsRaw
 
 /// Calculate median and MAD for an array
 let private calculateChannelMAD (values: float[]) =
@@ -177,7 +196,7 @@ let paintDetectedStars (pixels: byte[]) (width: int) (height: int) (channels: in
             paintCircle pixels width height channels ch star.X star.Y radius intensity format
 
 /// Process single file in detect mode
-let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool) (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams) (intensity: float) =
+let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool) (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams) (intensity: float) (masters: (MasterFrames * CalibrationConfig) option) =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -199,8 +218,9 @@ let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            // Get pixel data and detect stars
-            let pixelFloats = PixelIO.readPixelsAsFloat img
+            // Get pixel data, calibrate, and detect stars
+            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
+            let pixelFloats = applyCalibration pixelFloatsRaw masters
             let channel0 =
                 if channels = 1 then pixelFloats
                 else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
@@ -279,7 +299,7 @@ let processMatchFile
     (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool)
     (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams)
     (refStars: DetectedStar[]) (refTriangles: Triangle[])
-    (opts: AlignOptions) =
+    (opts: AlignOptions) (masters: (MasterFrames * CalibrationConfig) option) =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -301,8 +321,9 @@ let processMatchFile
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            // Get pixel data and detect stars
-            let pixelFloats = PixelIO.readPixelsAsFloat img
+            // Get pixel data, calibrate, and detect stars
+            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
+            let pixelFloats = applyCalibration pixelFloatsRaw masters
             let channel0 =
                 if channels = 1 then pixelFloats
                 else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
@@ -423,7 +444,7 @@ let processAlignFile
     (detectionParams: DetectionParams)
     (refStars: DetectedStar[]) (refTriangles: Triangle[])
     (refFileName: string) (imageWidth: int) (imageHeight: int)
-    (opts: AlignOptions)
+    (opts: AlignOptions) (masters: (MasterFrames * CalibrationConfig) option)
     : Async<bool> =
     async {
         try
@@ -452,8 +473,9 @@ let processAlignFile
                 return false
             else
 
-            // Get pixel data and detect stars
-            let pixelFloats = PixelIO.readPixelsAsFloat img
+            // Get pixel data, calibrate, and detect stars
+            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
+            let pixelFloats = applyCalibration pixelFloatsRaw masters
             let channel0 =
                 if channels = 1 then pixelFloats
                 else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
@@ -754,7 +776,7 @@ let processDistortionFile
     (detectionParams: DetectionParams)
     (refStars: DetectedStar[]) (refTriangles: Triangle[])
     (imageWidth: int) (imageHeight: int)
-    (opts: AlignOptions)
+    (opts: AlignOptions) (masters: (MasterFrames * CalibrationConfig) option)
     : Async<bool> =
     async {
         try
@@ -1007,6 +1029,16 @@ let showHelp() =
     printfn "  --include-distortion-model Output distortion heatmap alongside aligned images"
     printfn "  --include-detection-model  Output star detection visualization alongside aligned images"
     printfn ""
+    printfn "Calibration (applied before star detection):"
+    printfn "  --bias, -b <file>         Master bias frame"
+    printfn "  --bias-level <value>      Constant bias value (alternative to --bias)"
+    printfn "  --dark, -d <file>         Master dark frame"
+    printfn "  --flat, -f <file>         Master flat frame"
+    printfn "  --uncalibrated-dark       Dark is raw (not bias-subtracted)"
+    printfn "  --uncalibrated-flat       Flat is raw (not bias/dark-subtracted)"
+    printfn "  --optimize-dark           Optimize dark scaling for temperature/exposure differences"
+    printfn "  --pedestal <value>        Output pedestal [0-65535] (default: 0)"
+    printfn ""
     printfn "Examples:"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\""
@@ -1108,6 +1140,23 @@ let parseArgs (args: string array) : AlignOptions =
             parse rest { opts with IncludeDistortionModel = true }
         | "--include-detection-model" :: rest ->
             parse rest { opts with IncludeDetectionModel = true }
+        // Calibration
+        | "--bias" :: value :: rest | "-b" :: value :: rest ->
+            parse rest { opts with BiasFrame = Some value }
+        | "--bias-level" :: value :: rest ->
+            parse rest { opts with BiasLevel = Some (float value) }
+        | "--dark" :: value :: rest | "-d" :: value :: rest ->
+            parse rest { opts with DarkFrame = Some value }
+        | "--flat" :: value :: rest | "-f" :: value :: rest ->
+            parse rest { opts with FlatFrame = Some value }
+        | "--uncalibrated-dark" :: rest ->
+            parse rest { opts with UncalibratedDark = true }
+        | "--uncalibrated-flat" :: rest ->
+            parse rest { opts with UncalibratedFlat = true }
+        | "--optimize-dark" :: rest ->
+            parse rest { opts with OptimizeDark = true }
+        | "--pedestal" :: value :: rest ->
+            parse rest { opts with OutputPedestal = int value }
         | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
@@ -1141,6 +1190,14 @@ let parseArgs (args: string array) : AlignOptions =
         ShowDistortionStats = false
         IncludeDistortionModel = false
         IncludeDetectionModel = false
+        BiasFrame = None
+        BiasLevel = None
+        DarkFrame = None
+        FlatFrame = None
+        UncalibratedDark = false
+        UncalibratedFlat = false
+        OptimizeDark = false
+        OutputPedestal = 0
     }
 
     let opts = parse (List.ofArray args) defaults
@@ -1166,6 +1223,25 @@ let parseArgs (args: string array) : AlignOptions =
     if opts.AnchorStars < 4 then failwith "Anchor stars must be at least 4"
     if opts.RBFSupportFactor < 1.0 then failwith "RBF support factor must be at least 1.0"
     if opts.RBFRegularization < 0.0 then failwith "RBF regularization must be non-negative"
+
+    // Calibration validation (same as Commands.Calibrate)
+    if opts.BiasFrame.IsSome && opts.BiasLevel.IsSome then
+        failwith "--bias and --bias-level are mutually exclusive"
+    if opts.UncalibratedDark && opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
+        failwith "--uncalibrated-dark requires --bias or --bias-level"
+    if opts.UncalibratedFlat && opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
+        failwith "--uncalibrated-flat requires --bias or --bias-level"
+    if opts.UncalibratedFlat && opts.DarkFrame.IsNone then
+        failwith "--uncalibrated-flat requires --dark"
+    if opts.OptimizeDark then
+        if opts.DarkFrame.IsNone then
+            failwith "--optimize-dark requires --dark"
+        if not opts.UncalibratedDark then
+            failwith "--optimize-dark requires --uncalibrated-dark"
+        if opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
+            failwith "--optimize-dark requires --bias or --bias-level"
+    if opts.OutputPedestal < 0 || opts.OutputPedestal > 65535 then
+        failwith "Pedestal must be in range [0, 65535]"
 
     opts
 
@@ -1224,8 +1300,42 @@ let run (args: string array) =
 
                 printfn $"Image dimensions: {width}x{height}, {channels} channel(s)"
 
-                // Get reference pixel data and detect stars
-                let refPixels = PixelIO.readPixelsAsFloat refImage
+                // Load calibration masters if configured
+                let! masters =
+                    if opts.BiasFrame.IsSome || opts.DarkFrame.IsSome || opts.FlatFrame.IsSome then
+                        async {
+                            let calConfig: CalibrationConfig = {
+                                BiasFrame = opts.BiasFrame
+                                BiasLevel = opts.BiasLevel
+                                DarkFrame = opts.DarkFrame
+                                FlatFrame = opts.FlatFrame
+                                UncalibratedDark = opts.UncalibratedDark
+                                UncalibratedFlat = opts.UncalibratedFlat
+                                OptimizeDark = opts.OptimizeDark
+                                OutputPedestal = opts.OutputPedestal
+                            }
+                            printfn "Loading calibration masters..."
+                            let! m = loadMasterFrames calConfig
+
+                            // Log what was loaded
+                            match calConfig.BiasFrame with
+                            | Some path -> Log.Information("Master bias: {Path}", Path.GetFileName path)
+                            | None -> ()
+                            match calConfig.DarkFrame with
+                            | Some path -> Log.Information("Master dark: {Path}", Path.GetFileName path)
+                            | None -> ()
+                            match calConfig.FlatFrame with
+                            | Some path -> Log.Information("Master flat: {Path}", Path.GetFileName path)
+                            | None -> ()
+
+                            return Some (m, calConfig)
+                        }
+                    else
+                        async { return None }
+
+                // Get reference pixel data and calibrate
+                let refPixelsRaw = PixelIO.readPixelsAsFloat refImage
+                let refPixels = applyCalibration refPixelsRaw masters
 
                 // Use first channel for star detection
                 let refChannel0 =
@@ -1280,7 +1390,7 @@ let run (args: string array) =
 
                     // Process all files in parallel
                     let tasks = files |> Array.map (fun f ->
-                        processDetectFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams opts.Intensity)
+                        processDetectFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams opts.Intensity masters)
                     let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                     let successCount = results |> Array.filter id |> Array.length
@@ -1308,7 +1418,7 @@ let run (args: string array) =
 
                     // Process all files in parallel
                     let tasks = files |> Array.map (fun f ->
-                        processMatchFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams refStars refTriangles opts)
+                        processMatchFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams refStars refTriangles opts masters)
                     let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                     let successCount = results |> Array.filter id |> Array.length
@@ -1335,7 +1445,7 @@ let run (args: string array) =
 
                     // Process all files in parallel
                     let tasks = files |> Array.map (fun f ->
-                        processAlignFile f opts.Output opts.Suffix opts.Overwrite detectionParams refStars refTriangles refFileName width height opts)
+                        processAlignFile f opts.Output opts.Suffix opts.Overwrite detectionParams refStars refTriangles refFileName width height opts masters)
                     let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                     let successCount = results |> Array.filter id |> Array.length
@@ -1363,7 +1473,7 @@ let run (args: string array) =
 
                     // Process all files in parallel
                     let tasks = files |> Array.map (fun f ->
-                        processDistortionFile f opts.Output suffix opts.Overwrite detectionParams refStars refTriangles width height opts)
+                        processDistortionFile f opts.Output suffix opts.Overwrite detectionParams refStars refTriangles width height opts masters)
                     let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                     let successCount = results |> Array.filter id |> Array.length

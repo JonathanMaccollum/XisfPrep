@@ -5,6 +5,7 @@ open System.IO
 open Serilog
 open XisfLib.Core
 open Algorithms.Statistics
+open Algorithms.Calibration
 
 // --- Type Definitions ---
 
@@ -36,14 +37,6 @@ type IntegrationSettings = {
     Rejection: RejectionMethod
     RejectionNormalization: RejectionNormalization
     Iterations: int
-}
-
-type InlineCalibrationConfig = {
-    BiasFrame: string option
-    BiasLevel: float option
-    DarkFrame: string option
-    UncalibratedDark: bool
-    Pedestal: int
 }
 
 // --- Defaults ---
@@ -219,21 +212,24 @@ let parseArgs (args: string array) =
                 Iterations = iterations
             }
 
-            // Build inline calibration config
-            let inlineCalibration =
+            // Build calibration config for Algorithms.Calibration
+            let calibrationConfig =
                 if state.BiasFrame.IsSome || state.BiasLevel.IsSome || state.DarkFrame.IsSome || pedestal > 0 then
                     Some {
                         BiasFrame = state.BiasFrame
                         BiasLevel = state.BiasLevel
                         DarkFrame = state.DarkFrame
+                        FlatFrame = None  // Integrate doesn't use flat
                         UncalibratedDark = state.UncalibratedDark
-                        Pedestal = pedestal
+                        UncalibratedFlat = false  // Not applicable
+                        OptimizeDark = false  // Not used in integrate
+                        OutputPedestal = pedestal
                     }
                 else
                     None
 
             // Return the 6-tuple that the 'run' function expects
-            (input, output, settings, state.Overwrite, state.OutputFormat, inlineCalibration)
+            (input, output, settings, state.Overwrite, state.OutputFormat, calibrationConfig)
 
         // Recursive calls are now clean and unambiguous
         | "--input" :: value :: rest | "-i" :: value :: rest ->
@@ -409,109 +405,7 @@ module LinearFit =
             let survivingIndices = surviving |> Array.map fst |> Set.ofArray
             Array.init n (fun i -> survivingIndices.Contains i)
 
-// --- Inline Calibration Module ---
-module InlineCalibration =
-    type LoadedMasters = {
-        BiasData: float[] option
-        DarkData: float[] option
-        Width: int
-        Height: int
-        Channels: int
-    }
-
-    let loadFrameAsFloat (path: string) : Async<float[] * int * int * int> =
-        async {
-            let reader = new XisfReader()
-            let! metadata = reader.ReadAsync(path) |> Async.AwaitTask
-
-            if metadata.Images.Count = 0 then
-                failwithf "No images found in file: %s" path
-
-            let img = metadata.Images.[0]
-            let width = int img.Geometry.Width
-            let height = int img.Geometry.Height
-            let channels = int img.Geometry.ChannelCount
-            let floatData = PixelIO.readPixelsAsFloat img
-
-            return (floatData, width, height, channels)
-        }
-
-    let loadMasters (config: InlineCalibrationConfig) : Async<LoadedMasters option> =
-        async {
-            let mutable width = 0
-            let mutable height = 0
-            let mutable channels = 0
-            let mutable biasData = None
-            let mutable darkData = None
-
-            // Load bias frame
-            match config.BiasFrame with
-            | Some path ->
-                Log.Information("Loading master bias for inline calibration: {Path}", path)
-                let! (data, w, h, c) = loadFrameAsFloat path
-                width <- w
-                height <- h
-                channels <- c
-                biasData <- Some data
-            | None -> ()
-
-            // Load dark frame
-            match config.DarkFrame with
-            | Some path ->
-                Log.Information("Loading master dark for inline calibration: {Path}", path)
-                let! (data, w, h, c) = loadFrameAsFloat path
-                if width > 0 && (w <> width || h <> height || c <> channels) then
-                    failwithf "Dark dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
-                width <- w
-                height <- h
-                channels <- c
-                darkData <- Some data
-            | None -> ()
-
-            if biasData.IsNone && darkData.IsNone && config.BiasLevel.IsNone && config.Pedestal = 0 then
-                return None
-            else
-                return Some {
-                    BiasData = biasData
-                    DarkData = darkData
-                    Width = width
-                    Height = height
-                    Channels = channels
-                }
-        }
-
-    let calibratePixels (pixels: float[]) (masters: LoadedMasters) (config: InlineCalibrationConfig) : float[] =
-        let result = Array.zeroCreate pixels.Length
-
-        for i = 0 to pixels.Length - 1 do
-            let lightValue = pixels.[i]
-
-            // Get bias value
-            let biasValue =
-                match masters.BiasData, config.BiasLevel with
-                | Some data, _ -> data.[i]
-                | None, Some level -> level
-                | None, None -> 0.0
-
-            let afterBias = lightValue - biasValue
-
-            // Apply dark subtraction
-            let afterDark =
-                match masters.DarkData with
-                | Some darkData ->
-                    let darkValue = darkData.[i]
-                    if config.UncalibratedDark then
-                        // Dark contains bias, subtract it
-                        afterBias - (darkValue - biasValue)
-                    else
-                        afterBias - darkValue
-                | None -> afterBias
-
-            // Add pedestal and clamp
-            let final = afterDark + float config.Pedestal
-            result.[i] <- max 0.0 (min 65535.0 final)
-
-        result
+// Inline calibration now uses Algorithms.Calibration
 
 // --- Header Analysis Module ---
 module HeaderAnalysis =
@@ -788,7 +682,12 @@ let run (args: string array) =
                 // Load inline calibration masters if configured
                 let! inlineMasters =
                     match inlineCalConfig with
-                    | Some config -> InlineCalibration.loadMasters config
+                    | Some config ->
+                        async {
+                            Log.Information("Loading master calibration frames for inline calibration")
+                            let! masters = loadMasterFrames config
+                            return Some masters
+                        }
                     | None -> async { return None }
 
                 // Find input files
@@ -863,13 +762,15 @@ let run (args: string array) =
                     | Some masters, Some config ->
                         printfn "Applying inline calibration to input images..."
                         // Validate dimensions match
-                        if masters.Width > 0 && (masters.Width <> width || masters.Height <> height || masters.Channels <> channels) then
-                            failwithf "Master frame dimension mismatch: Expected %dx%dx%d, got %dx%dx%d"
-                                width height channels masters.Width masters.Height masters.Channels
+                        match validateDimensions masters width height channels with
+                        | Error msg -> failwith msg
+                        | Ok () -> ()
+
                         images
                         |> Array.Parallel.map (fun img ->
                             let rawPixels = PixelIO.readPixelsAsFloat img
-                            InlineCalibration.calibratePixels rawPixels masters config
+                            let result = calibratePixels rawPixels masters config
+                            result.CalibratedPixels
                         )
                     | _ ->
                         images |> Array.map PixelIO.readPixelsAsFloat
@@ -988,15 +889,10 @@ let run (args: string array) =
                 let calibrationHistory =
                     match inlineCalConfig with
                     | Some config ->
-                        [|
-                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.masterBias: %s"
-                                (config.BiasFrame |> Option.map Path.GetFileName |> Option.defaultValue "(none)")) :> XisfCoreElement
-                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.biasLevel: %s"
-                                (config.BiasLevel |> Option.map string |> Option.defaultValue "(none)")) :> XisfCoreElement
-                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.masterDark: %s"
-                                (config.DarkFrame |> Option.map Path.GetFileName |> Option.defaultValue "(none)")) :> XisfCoreElement
-                            XisfFitsKeyword("HISTORY", "", sprintf "InlineCalibration.pedestal: %d" config.Pedestal) :> XisfCoreElement
-                        |]
+                        let historyEntries = buildCalibrationHistory config
+                        historyEntries
+                        |> List.map (fun text -> XisfFitsKeyword("HISTORY", "", text) :> XisfCoreElement)
+                        |> Array.ofList
                     | None -> [||]
 
                 // Build integration HISTORY entries
