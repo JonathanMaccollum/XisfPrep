@@ -24,6 +24,7 @@ let showUsage() =
     printfn "  debayer     Convert Bayer mosaic to RGB"
     printfn "  headers     Extract FITS keywords and HISTORY values"
     printfn "  align       Register images to reference"
+    printfn "  align2      Register images (railway-oriented pipeline)"
     printfn "  integrate   Stack/combine multiple images"
     printfn "  stats       Calculate image statistics"
     printfn "  stars       Detect stars and generate visualization"
@@ -44,6 +45,7 @@ let commandHandlers =
         "debayer", Commands.Debayer.run
         "headers", Commands.Headers.run
         "align", Commands.Align.run
+        "align2", Commands.Align2.run
         "integrate", Commands.Integrate.run
         "stats", Commands.Stats.run
         "stars", Commands.Stars.run

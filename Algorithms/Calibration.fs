@@ -2,10 +2,66 @@ module Algorithms.Calibration
 
 open System
 open System.IO
+open Serilog
 open XisfLib.Core
 open Algorithms.Statistics
+open FsToolkit.ErrorHandling
+
+type AsyncResult<'T, 'E> = Async<Result<'T, 'E>>
 
 // --- Types ---
+
+/// Calibration errors
+type CalibrationError =
+    | BiasFrameNotFound of path: string
+    | DarkFrameNotFound of path: string
+    | FlatFrameNotFound of path: string
+    | NoImagesInFile of path: string
+    | DimensionMismatch of frame: string * expected: (int * int * int) * actual: (int * int * int)
+    | LoadFailed of frame: string * reason: string
+
+    override this.ToString() =
+        match this with
+        | BiasFrameNotFound path -> $"Bias frame not found: {path}"
+        | DarkFrameNotFound path -> $"Dark frame not found: {path}"
+        | FlatFrameNotFound path -> $"Flat frame not found: {path}"
+        | NoImagesInFile path -> $"No images found in file: {path}"
+        | DimensionMismatch (frame, (ew, eh, ec), (aw, ah, ac)) ->
+            $"{frame} dimension mismatch: Expected {ew}×{eh}×{ec}, got {aw}×{ah}×{ac}"
+        | LoadFailed (frame, reason) -> $"Failed to load {frame}: {reason}"
+
+/// Calibration configuration validation errors
+type CalibrationValidationError =
+    | BiasOptionsConflict
+    | UncalibratedDarkRequiresDark
+    | UncalibratedDarkRequiresBias
+    | UncalibratedFlatRequiresBias
+    | UncalibratedFlatRequiresDark
+    | OptimizeDarkRequiresDark
+    | OptimizeDarkRequiresUncalibratedDark
+    | OptimizeDarkRequiresBias
+    | InvalidPedestal of value: int
+
+    override this.ToString() =
+        match this with
+        | BiasOptionsConflict ->
+            "--bias and --bias-level are mutually exclusive"
+        | UncalibratedDarkRequiresDark ->
+            "--uncalibrated-dark requires --dark"
+        | UncalibratedDarkRequiresBias ->
+            "--uncalibrated-dark requires --bias or --bias-level"
+        | UncalibratedFlatRequiresBias ->
+            "--uncalibrated-flat requires --bias or --bias-level"
+        | UncalibratedFlatRequiresDark ->
+            "--uncalibrated-flat requires --dark"
+        | OptimizeDarkRequiresDark ->
+            "--optimize-dark requires --dark"
+        | OptimizeDarkRequiresUncalibratedDark ->
+            "--optimize-dark requires --uncalibrated-dark (dark frame must be raw/uncalibrated)"
+        | OptimizeDarkRequiresBias ->
+            "--optimize-dark requires --bias or --bias-level"
+        | InvalidPedestal value ->
+            $"Pedestal must be in range [0, 65535], got {value}"
 
 /// Loaded master calibration frames
 type MasterFrames = {
@@ -58,28 +114,39 @@ let maxPrecisionFormat (formats: XisfSampleFormat list) =
 // --- Master Frame Loading ---
 
 /// Load a single XISF frame as float array
-let loadFrameAsFloat (path: string) : Async<float[] * int * int * int * XisfSampleFormat> =
-    async {
-        let reader = new XisfReader()
-        let! metadata = reader.ReadAsync(path) |> Async.AwaitTask
+let private loadFrameAsFloat (path: string) (frameName: string) : AsyncResult<float[] * int * int * int * XisfSampleFormat, CalibrationError> =
+    asyncResult {
+        if not (File.Exists path) then
+            return! Error (match frameName with
+                           | "bias" -> BiasFrameNotFound path
+                           | "dark" -> DarkFrameNotFound path
+                           | "flat" -> FlatFrameNotFound path
+                           | _ -> LoadFailed (frameName, "File not found"))
+                    |> AsyncResult.ofResult
+        else
+            try
+                let reader = new XisfReader()
+                let! metadata = reader.ReadAsync(path) |> Async.AwaitTask |> AsyncResult.ofAsync
 
-        if metadata.Images.Count = 0 then
-            failwithf "No images found in file: %s" path
+                if metadata.Images.Count = 0 then
+                    return! Error (NoImagesInFile path) |> AsyncResult.ofResult
+                else
+                    let img = metadata.Images.[0]
+                    let width = int img.Geometry.Width
+                    let height = int img.Geometry.Height
+                    let channels = int img.Geometry.ChannelCount
+                    let sampleFormat = img.SampleFormat
 
-        let img = metadata.Images.[0]
-        let width = int img.Geometry.Width
-        let height = int img.Geometry.Height
-        let channels = int img.Geometry.ChannelCount
-        let sampleFormat = img.SampleFormat
+                    let floatData = PixelIO.readPixelsAsFloat img
 
-        let floatData = PixelIO.readPixelsAsFloat img
-
-        return (floatData, width, height, channels, sampleFormat)
+                    return (floatData, width, height, channels, sampleFormat)
+            with ex ->
+                return! Error (LoadFailed (frameName, ex.Message)) |> AsyncResult.ofResult
     }
 
 /// Load master calibration frames from disk
-let loadMasterFrames (config: CalibrationConfig) : Async<MasterFrames> =
-    async {
+let loadMasterFrames (config: CalibrationConfig) : AsyncResult<MasterFrames, CalibrationError> =
+    asyncResult {
         let mutable width = 0
         let mutable height = 0
         let mutable channels = 0
@@ -92,7 +159,7 @@ let loadMasterFrames (config: CalibrationConfig) : Async<MasterFrames> =
         // Load bias frame or use constant bias level
         match config.BiasFrame, config.BiasLevel with
         | Some path, _ ->
-            let! (data, w, h, c, fmt) = loadFrameAsFloat path
+            let! (data, w, h, c, fmt) = loadFrameAsFloat path "bias"
             width <- w
             height <- h
             channels <- c
@@ -107,32 +174,36 @@ let loadMasterFrames (config: CalibrationConfig) : Async<MasterFrames> =
         // Load dark frame
         match config.DarkFrame with
         | Some path ->
-            let! (data, w, h, c, fmt) = loadFrameAsFloat path
+            let! (data, w, h, c, fmt) = loadFrameAsFloat path "dark"
             if width > 0 && (w <> width || h <> height || c <> channels) then
-                failwithf "Dark dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
-            width <- w
-            height <- h
-            channels <- c
-            darkData <- Some data
-            formats <- fmt :: formats
+                return! Error (DimensionMismatch ("dark", (width, height, channels), (w, h, c)))
+                        |> AsyncResult.ofResult
+            else
+                width <- w
+                height <- h
+                channels <- c
+                darkData <- Some data
+                formats <- fmt :: formats
         | None ->
             ()
 
         // Load flat frame
         match config.FlatFrame with
         | Some path ->
-            let! (data, w, h, c, fmt) = loadFrameAsFloat path
+            let! (data, w, h, c, fmt) = loadFrameAsFloat path "flat"
             if width > 0 && (w <> width || h <> height || c <> channels) then
-                failwithf "Flat dimension mismatch: Expected %dx%dx%d, got %dx%dx%d" width height channels w h c
-            width <- w
-            height <- h
-            channels <- c
+                return! Error (DimensionMismatch ("flat", (width, height, channels), (w, h, c)))
+                        |> AsyncResult.ofResult
+            else
+                width <- w
+                height <- h
+                channels <- c
 
-            // Calculate median for normalization
-            let median = calculateMedian data
-            flatData <- Some data
-            flatMedian <- Some median
-            formats <- fmt :: formats
+                // Calculate median for normalization
+                let median = calculateMedian data
+                flatData <- Some data
+                flatMedian <- Some median
+                formats <- fmt :: formats
         | None ->
             ()
 
@@ -140,6 +211,18 @@ let loadMasterFrames (config: CalibrationConfig) : Async<MasterFrames> =
         let maxFormat =
             if List.isEmpty formats then XisfSampleFormat.UInt16
             else maxPrecisionFormat formats
+
+        // Log what was loaded
+        config.BiasFrame |> Option.iter (fun path ->
+            Log.Information("Master bias: {Path}", Path.GetFileName path))
+        config.BiasLevel |> Option.iter (fun level ->
+            Log.Information("Bias level: {Level}", level))
+        config.DarkFrame |> Option.iter (fun path ->
+            Log.Information("Master dark: {Path}", Path.GetFileName path))
+        config.FlatFrame |> Option.iter (fun path ->
+            Log.Information("Master flat: {Path}", Path.GetFileName path)
+            flatMedian |> Option.iter (fun median ->
+                Log.Information("Flat median: {Median:F2}", median)))
 
         return {
             BiasData = biasData
@@ -405,6 +488,29 @@ let buildCalibrationProperties (config: CalibrationConfig) (darkScale: float) =
 
 // --- Validation ---
 
+/// Validate calibration configuration options
+let validateConfig (config: CalibrationConfig) : Result<unit, CalibrationValidationError> =
+    if config.BiasFrame.IsSome && config.BiasLevel.IsSome then
+        Error BiasOptionsConflict
+    elif config.UncalibratedDark && config.DarkFrame.IsNone then
+        Error UncalibratedDarkRequiresDark
+    elif config.UncalibratedDark && config.BiasFrame.IsNone && config.BiasLevel.IsNone then
+        Error UncalibratedDarkRequiresBias
+    elif config.UncalibratedFlat && config.BiasFrame.IsNone && config.BiasLevel.IsNone then
+        Error UncalibratedFlatRequiresBias
+    elif config.UncalibratedFlat && config.DarkFrame.IsNone then
+        Error UncalibratedFlatRequiresDark
+    elif config.OptimizeDark && config.DarkFrame.IsNone then
+        Error OptimizeDarkRequiresDark
+    elif config.OptimizeDark && not config.UncalibratedDark then
+        Error OptimizeDarkRequiresUncalibratedDark
+    elif config.OptimizeDark && config.BiasFrame.IsNone && config.BiasLevel.IsNone then
+        Error OptimizeDarkRequiresBias
+    elif config.OutputPedestal < 0 || config.OutputPedestal > 65535 then
+        Error (InvalidPedestal config.OutputPedestal)
+    else
+        Ok ()
+
 /// Validate master frame dimensions match target image
 let validateDimensions (masters: MasterFrames) (width: int) (height: int) (channels: int) : Result<unit, string> =
     if masters.Width > 0 && (width <> masters.Width || height <> masters.Height || channels <> masters.Channels) then
@@ -412,3 +518,4 @@ let validateDimensions (masters: MasterFrames) (width: int) (height: int) (chann
             masters.Width masters.Height masters.Channels width height channels)
     else
         Ok ()
+

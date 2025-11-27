@@ -14,6 +14,8 @@ open Algorithms.SpatialMatch
 open Algorithms.Interpolation
 open Algorithms.RBFTransform
 open Algorithms.Calibration
+open Algorithms.InputValidation
+open Algorithms.Binning
 
 // Type aliases for star detection types
 type DetectedStar = Algorithms.StarDetection.DetectedStar
@@ -64,7 +66,6 @@ let private defaultAnchorDistribution = SpatialMatch.Center
 let private defaultDistortion = NoDistortion
 let private defaultRBFSupportFactor = 3.0
 let private defaultRBFRegularization = 1e-6
-// ---
 
 type AlignOptions = {
     Input: string
@@ -111,6 +112,9 @@ type AlignOptions = {
     UncalibratedFlat: bool
     OptimizeDark: bool
     OutputPedestal: int
+    // Binning
+    BinFactor: int option
+    BinMethod: BinningMethod
 }
 
 // --- Helper Functions ---
@@ -124,6 +128,38 @@ let private applyCalibration (pixelsRaw: float[]) (masters: (MasterFrames * Cali
     | None ->
         pixelsRaw
 
+/// Apply binning if factor specified (after calibration)
+let private applyBinning
+    (pixels: float[])
+    (width: int)
+    (height: int)
+    (channels: int)
+    (binFactor: int option)
+    (binMethod: BinningMethod)
+    : (float[] * int * int) =
+    match binFactor with
+    | None ->
+        (pixels, width, height)
+    | Some factor ->
+        let config: BinningConfig = {
+            Factor = factor
+            Method = binMethod
+        }
+
+        // Validate and bin
+        match validateConfig config with
+        | Error err ->
+            Log.Warning($"Binning validation failed: {err}, skipping binning")
+            (pixels, width, height)
+        | Ok () ->
+            match validateDimensions width height channels factor with
+            | Error err ->
+                Log.Warning($"Binning dimensions invalid: {err}, skipping binning")
+                (pixels, width, height)
+            | Ok _truncated ->
+                let result = binPixels pixels width height channels config
+                (result.BinnedPixels, result.NewWidth, result.NewHeight)
+
 /// Calculate median and MAD for an array
 let private calculateChannelMAD (values: float[]) =
     if values.Length = 0 then 0.0
@@ -134,6 +170,268 @@ let private calculateChannelMAD (values: float[]) =
             if sorted.Length % 2 = 0 then (sorted.[mid - 1] + sorted.[mid]) / 2.0
             else sorted.[mid]
         calculateMAD values median
+
+open FsToolkit.ErrorHandling
+
+// Type alias for cleaner signatures
+type AsyncResult<'T, 'E> = Async<Result<'T, 'E>>
+
+/// Domain errors for align command
+type AlignError =
+    | InputValidation of InputValidationError
+    | InsufficientStars of count: int * required: int
+    | ImageLoadFailed of file: string * reason: string
+    | CalibrationFailed of CalibrationError
+
+    override this.ToString() =
+        match this with
+        | InputValidation err ->
+            err.ToString()
+        | InsufficientStars (count, required) ->
+            $"Insufficient stars in reference image: found {count}, need at least {required}"
+        | ImageLoadFailed (file, reason) ->
+            $"Failed to load image '{file}': {reason}"
+        | CalibrationFailed err ->
+            $"Failed to load calibration masters: {err}"
+
+/// Align command validation errors
+type AlignValidationError =
+    | MissingInput
+    | MissingOutput
+    | ReferenceOptionsConflict
+    | InvalidParallelCount of value: int
+    | InvalidThreshold of value: float
+    | InvalidGridSize of value: int
+    | InvalidMinFWHM of value: float
+    | InvalidMaxFWHM of min: float * max: float
+    | InvalidMaxEccentricity of value: float
+    | InvalidMaxStars of value: int
+    | InvalidRatioTolerance of value: float
+    | InvalidMaxStarsTriangles of value: int
+    | InvalidMinVotes of value: int
+    | InvalidIntensity of value: float
+    | InvalidAnchorStars of value: int
+    | InvalidRBFSupportFactor of value: float
+    | InvalidRBFRegularization of value: float
+    | InvalidBinFactor of value: int
+
+    override this.ToString() =
+        match this with
+        | MissingInput -> "Required argument: --input"
+        | MissingOutput -> "Required argument: --output"
+        | ReferenceOptionsConflict -> "--reference and --auto-reference are mutually exclusive"
+        | InvalidParallelCount value -> $"Parallel count must be at least 1, got {value}"
+        | InvalidThreshold value -> $"Threshold must be positive, got {value}"
+        | InvalidGridSize value -> $"Grid size must be at least 16, got {value}"
+        | InvalidMinFWHM value -> $"Min FWHM must be positive, got {value}"
+        | InvalidMaxFWHM (min, max) -> $"Max FWHM ({max}) must be greater than min FWHM ({min})"
+        | InvalidMaxEccentricity value -> $"Max eccentricity must be between 0 and 1, got {value}"
+        | InvalidMaxStars value -> $"Max stars must be at least 1, got {value}"
+        | InvalidRatioTolerance value -> $"Ratio tolerance must be positive, got {value}"
+        | InvalidMaxStarsTriangles value -> $"Max stars for triangles must be at least 3, got {value}"
+        | InvalidMinVotes value -> $"Min votes must be at least 1, got {value}"
+        | InvalidIntensity value -> $"Intensity must be between 0 and 1, got {value}"
+        | InvalidAnchorStars value -> $"Anchor stars must be at least 4, got {value}"
+        | InvalidRBFSupportFactor value -> $"RBF support factor must be at least 1.0, got {value}"
+        | InvalidRBFRegularization value -> $"RBF regularization must be non-negative, got {value}"
+        | InvalidBinFactor value -> $"Bin factor must be between 2 and 6, got {value}"
+
+/// Reference image metadata
+type ReferenceMetadata = {
+    FileName: string
+    Width: int
+    Height: int
+    Channels: int
+}
+
+/// Complete reference analysis result
+type ReferenceData = {
+    Stars: DetectedStar[]
+    Triangles: Triangle[]
+    Metadata: ReferenceMetadata
+    DetectionParams: DetectionParams
+    Masters: (MasterFrames * CalibrationConfig) option
+}
+
+/// Encapsulates all state needed for batch processing
+type ProcessingContext = {
+    Opts: AlignOptions
+    Files: string[]
+    OutputDirectory: string
+    Reference: ReferenceData
+}
+
+/// Result of processing a batch
+type ProcessingResult = {
+    TotalFiles: int
+    SuccessCount: int
+    FailedCount: int
+    Duration: System.TimeSpan
+}
+
+/// Load calibration masters if configured
+let private loadCalibrationMasters (opts: AlignOptions) : AsyncResult<(MasterFrames * CalibrationConfig) option, AlignError> =
+    asyncResult {
+        if opts.BiasFrame.IsNone && opts.DarkFrame.IsNone && opts.FlatFrame.IsNone then
+            return None
+        else
+            let calConfig: CalibrationConfig = {
+                BiasFrame = opts.BiasFrame
+                BiasLevel = opts.BiasLevel
+                DarkFrame = opts.DarkFrame
+                FlatFrame = opts.FlatFrame
+                UncalibratedDark = opts.UncalibratedDark
+                UncalibratedFlat = opts.UncalibratedFlat
+                OptimizeDark = opts.OptimizeDark
+                OutputPedestal = opts.OutputPedestal
+            }
+
+            printfn "Loading calibration masters..."
+
+            let! m = loadMasterFrames calConfig
+                     |> AsyncResult.mapError CalibrationFailed
+
+            return Some (m, calConfig)
+    }
+
+/// Analyze reference image: load, calibrate, detect stars
+let private analyzeReference
+    (file: string)
+    (opts: AlignOptions)
+    : AsyncResult<ReferenceData, AlignError> =
+    asyncResult {
+        printfn $"Reference: {Path.GetFileName file}"
+
+        try
+            // 1. Load reference image
+            let reader = new XisfReader()
+            let! refUnit = reader.ReadAsync(file)
+                           |> Async.AwaitTask
+                           |> AsyncResult.ofAsync
+            let refImage = refUnit.Images.[0]
+
+            let width = int refImage.Geometry.Width
+            let height = int refImage.Geometry.Height
+            let channels = int refImage.Geometry.ChannelCount
+
+            printfn $"Image dimensions: {width}x{height}, {channels} channel(s)"
+
+            // 2. Load calibration masters
+            let! masters = loadCalibrationMasters opts
+
+            // 3. Calibrate pixels
+            let refPixelsRaw = PixelIO.readPixelsAsFloat refImage
+            let refPixels = applyCalibration refPixelsRaw masters
+
+            // 4. Apply binning (after calibration)
+            let (refPixelsFinal, widthFinal, heightFinal) =
+                applyBinning refPixels width height channels opts.BinFactor opts.BinMethod
+
+            if opts.BinFactor.IsSome then
+                printfn $"Binned reference: {width}x{height} -> {widthFinal}x{heightFinal} ({opts.BinFactor.Value}x{opts.BinFactor.Value} {opts.BinMethod})"
+
+            // 5. Extract luminance channel
+            let refChannel0 =
+                if channels = 1 then refPixelsFinal
+                else Array.init (widthFinal * heightFinal) (fun i -> refPixelsFinal.[i * channels])
+
+            let refMAD = calculateChannelMAD refChannel0
+            printfn $"Detecting stars in reference (MAD: {refMAD:F2})..."
+
+            // 6. Build detection params
+            let detectionParams: DetectionParams = {
+                Threshold = opts.Threshold
+                GridSize = opts.GridSize
+                MinFWHM = opts.MinFWHM
+                MaxFWHM = opts.MaxFWHM
+                MaxEccentricity = opts.MaxEccentricity
+                MaxStars = Some opts.MaxStars
+            }
+
+            // 7. Detect stars (using binned dimensions)
+            let refStarsResult =
+                StarDetection.detectStarsInChannel
+                    refChannel0 widthFinal heightFinal refMAD 0 "Luminance" detectionParams
+
+            let stars = refStarsResult.Stars
+            printfn $"Reference stars detected: {stars.Length}"
+
+            // 8. Validate star count (railway switch point)
+            if stars.Length < 10 then
+                return! Error (InsufficientStars (stars.Length, 10)) |> AsyncResult.ofResult
+            else
+                // 9. Form triangles
+                let triangles = formTriangles stars opts.MaxStarsTriangles
+                printfn $"Reference triangles formed: {triangles.Length}"
+                printfn ""
+
+                return {
+                    Stars = stars
+                    Triangles = triangles
+                    Metadata = {
+                        FileName = Path.GetFileName file
+                        Width = widthFinal  // Use binned dimensions
+                        Height = heightFinal
+                        Channels = channels
+                    }
+                    DetectionParams = detectionParams
+                    Masters = masters
+                }
+        with ex ->
+            return! Error (ImageLoadFailed (Path.GetFileName file, ex.Message)) |> AsyncResult.ofResult
+    }
+
+/// Determine reference file from options
+let private resolveReferenceFile (files: string[]) (opts: AlignOptions) : string =
+    match opts.Reference with
+    | Some r -> r
+    | None ->
+        if opts.AutoReference then
+            printfn "Auto-reference selection not yet implemented, using first file"
+        files.[0]
+
+// --- Batch Processing Orchestration ---
+
+/// Execute batch processing for any mode
+/// Takes a task factory function and returns structured results
+let private runBatch
+    (ctx: ProcessingContext)
+    (suffix: string)
+    (mode: string)
+    (taskFactory: string -> Async<bool>)
+    : AsyncResult<ProcessingResult, AlignError> =
+    asyncResult {
+        // 1. Setup output directory
+        if not (Directory.Exists ctx.OutputDirectory) then
+            Directory.CreateDirectory(ctx.OutputDirectory) |> ignore
+            Log.Information($"Created output directory: {ctx.OutputDirectory}")
+
+        printfn $"Output mode: {mode}"
+        printfn ""
+
+        // 2. Execute tasks in parallel
+        let sw = Stopwatch.StartNew()
+        let tasks = ctx.Files |> Array.map taskFactory
+        let! results = Async.Parallel(tasks, maxDegreeOfParallelism = ctx.Opts.MaxParallel)
+                       |> AsyncResult.ofAsync
+        sw.Stop()
+
+        // 3. Aggregate results
+        let successCount = results |> Array.filter id |> Array.length
+        let failCount = results.Length - successCount
+
+        // 4. Report
+        printfn ""
+        let verb = if mode.Contains("align") then "Aligned" else "Processed"
+        printfn $"{verb} {successCount} images, {failCount} failed in {sw.Elapsed.TotalSeconds:F1}s"
+
+        return {
+            TotalFiles = results.Length
+            SuccessCount = successCount
+            FailedCount = failCount
+            Duration = sw.Elapsed
+        }
+    }
 
 // --- Image Transformation ---
 
@@ -196,7 +494,7 @@ let paintDetectedStars (pixels: byte[]) (width: int) (height: int) (channels: in
             paintCircle pixels width height channels ch star.X star.Y radius intensity format
 
 /// Process single file in detect mode
-let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool) (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams) (intensity: float) (masters: (MasterFrames * CalibrationConfig) option) =
+let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (overwrite: bool) (outputFormat: XisfSampleFormat option) (detectionParams: DetectionParams) (intensity: float) (masters: (MasterFrames * CalibrationConfig) option) (binFactor: int option) (binMethod: BinningMethod) =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -218,21 +516,24 @@ let processDetectFile (inputPath: string) (outputDir: string) (suffix: string) (
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            // Get pixel data, calibrate, and detect stars
+            // Get pixel data, calibrate, bin, and detect stars
             let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
             let pixelFloats = applyCalibration pixelFloatsRaw masters
+            let (pixelFloatsFinal, widthFinal, heightFinal) =
+                applyBinning pixelFloats width height channels binFactor binMethod
+
             let channel0 =
-                if channels = 1 then pixelFloats
-                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+                if channels = 1 then pixelFloatsFinal
+                else Array.init (widthFinal * heightFinal) (fun i -> pixelFloatsFinal.[i * channels])
 
             let mad = calculateChannelMAD channel0
-            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let starsResult = StarDetection.detectStarsInChannel channel0 widthFinal heightFinal mad 0 "Luminance" detectionParams
             let stars = starsResult.Stars
 
-            // Create output
+            // Create output (using binned dimensions)
             let format = outputFormat |> Option.defaultValue img.SampleFormat
-            let pixels = createBlackPixels width height channels format
-            paintDetectedStars pixels width height channels format stars intensity
+            let pixels = createBlackPixels widthFinal heightFinal channels format
+            paintDetectedStars pixels widthFinal heightFinal channels format stars intensity
 
             let headers = createDetectHeaders stars.Length detectionParams.Threshold detectionParams.GridSize
             let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
@@ -321,15 +622,18 @@ let processMatchFile
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            // Get pixel data, calibrate, and detect stars
+            // Get pixel data, calibrate, bin, and detect stars
             let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
             let pixelFloats = applyCalibration pixelFloatsRaw masters
+            let (pixelFloatsFinal, widthFinal, heightFinal) =
+                applyBinning pixelFloats width height channels opts.BinFactor opts.BinMethod
+
             let channel0 =
-                if channels = 1 then pixelFloats
-                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+                if channels = 1 then pixelFloatsFinal
+                else Array.init (widthFinal * heightFinal) (fun i -> pixelFloatsFinal.[i * channels])
 
             let mad = calculateChannelMAD channel0
-            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let starsResult = StarDetection.detectStarsInChannel channel0 widthFinal heightFinal mad 0 "Luminance" detectionParams
             let targetStars = starsResult.Stars
 
             // Run matching based on selected algorithm
@@ -354,7 +658,7 @@ let processMatchFile
                     (diag, matchedIndices)
 
                 | Expanding ->
-                    // Center-seeded expanding match
+                    // Center-seeded expanding match (use binned dimensions)
                     let config = {
                         defaultExpandingConfig with
                             AnchorStars = opts.AnchorStars
@@ -363,7 +667,7 @@ let processMatchFile
                             MinAnchorVotes = opts.MinVotes
                     }
 
-                    let result = matchExpanding refStars targetStars width height config
+                    let result = matchExpanding refStars targetStars widthFinal heightFinal config
 
                     // Convert to diagnostics format
                     let transform =
@@ -385,10 +689,10 @@ let processMatchFile
             let matchedCount = matchedTargetIndices.Count
             let unmatchedCount = targetStars.Length - matchedCount
 
-            // Create output
+            // Create output (using binned dimensions)
             let format = outputFormat |> Option.defaultValue img.SampleFormat
-            let pixels = createBlackPixels width height channels format
-            paintMatchVisualization pixels width height channels format targetStars refStars matchedTargetIndices opts.Intensity
+            let pixels = createBlackPixels widthFinal heightFinal channels format
+            paintMatchVisualization pixels widthFinal heightFinal channels format targetStars refStars matchedTargetIndices opts.Intensity
 
             let headers = createMatchHeaders targetStars.Length matchedCount unmatchedCount refStars.Length diag
             let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
@@ -467,21 +771,25 @@ let processAlignFile
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            // Verify dimensions match reference
-            if width <> imageWidth || height <> imageHeight then
-                Log.Error($"Image dimensions {width}x{height} don't match reference {imageWidth}x{imageHeight}: {fileName}")
+            // Get pixel data, calibrate, and bin
+            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
+            let pixelFloats = applyCalibration pixelFloatsRaw masters
+            let (pixelFloatsFinal, widthFinal, heightFinal) =
+                applyBinning pixelFloats width height channels opts.BinFactor opts.BinMethod
+
+            // Verify dimensions match reference (after binning)
+            if widthFinal <> imageWidth || heightFinal <> imageHeight then
+                Log.Error($"Image dimensions {widthFinal}x{heightFinal} don't match reference {imageWidth}x{imageHeight}: {fileName}")
                 return false
             else
 
-            // Get pixel data, calibrate, and detect stars
-            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
-            let pixelFloats = applyCalibration pixelFloatsRaw masters
+            // Detect stars in binned image
             let channel0 =
-                if channels = 1 then pixelFloats
-                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+                if channels = 1 then pixelFloatsFinal
+                else Array.init (widthFinal * heightFinal) (fun i -> pixelFloatsFinal.[i * channels])
 
             let mad = calculateChannelMAD channel0
-            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let starsResult = StarDetection.detectStarsInChannel channel0 widthFinal heightFinal mad 0 "Luminance" detectionParams
             let targetStars = starsResult.Stars
 
             // Run matching based on selected algorithm
@@ -519,7 +827,7 @@ let processAlignFile
                     | None -> None
 
                 | Expanding ->
-                    // Use expanding match algorithm
+                    // Use expanding match algorithm (use binned dimensions)
                     let config = {
                         defaultExpandingConfig with
                             AnchorStars = opts.AnchorStars
@@ -528,7 +836,7 @@ let processAlignFile
                             MinAnchorVotes = opts.MinVotes
                     }
 
-                    let result = matchExpanding refStars targetStars width height config
+                    let result = matchExpanding refStars targetStars widthFinal heightFinal config
 
                     // Extract matched pairs by finding correspondences via inverse transform
                     match result.Transform with
@@ -578,7 +886,7 @@ let processAlignFile
                             MaxControlPoints = 500
                         }
 
-                        let rbfResult = RBFTransform.setupRBF refStars targetStars matchedPairs transform rbfConfig width height
+                        let rbfResult = RBFTransform.setupRBF refStars targetStars matchedPairs transform rbfConfig widthFinal heightFinal
 
                         match rbfResult.Coefficients with
                         | Some coeffs ->
@@ -588,8 +896,8 @@ let processAlignFile
                             Log.Warning($"RBF setup failed for {fileName}, using similarity only")
                             (None, " [rbf failed]")
 
-                // Apply transformation
-                let transformedPixels = transformImage pixelFloats width height channels transform rbfCoeffs opts.Interpolation
+                // Apply transformation (to binned pixels)
+                let transformedPixels = transformImage pixelFloatsFinal widthFinal heightFinal channels transform rbfCoeffs opts.Interpolation
 
                 // Output as float32 for interpolation precision
                 // normalize=true converts [0, 65535] → [0, 1] for Float32
@@ -614,8 +922,8 @@ let processAlignFile
                 if opts.IncludeDetectionModel then
                     let detFileName = $"{baseName}_det.xisf"
                     let detPath = Path.Combine(outputDir, detFileName)
-                    let detPixels = createBlackPixels width height channels XisfSampleFormat.UInt16
-                    paintDetectedStars detPixels width height channels XisfSampleFormat.UInt16 targetStars opts.Intensity
+                    let detPixels = createBlackPixels widthFinal heightFinal channels XisfSampleFormat.UInt16
+                    paintDetectedStars detPixels widthFinal heightFinal channels XisfSampleFormat.UInt16 targetStars opts.Intensity
                     let detHeaders = createDetectHeaders targetStars.Length detectionParams.Threshold detectionParams.GridSize
                     let detInPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
                     let detOutputImage = createOutputImage img detPixels XisfSampleFormat.UInt16 detHeaders detInPlaceKeys
@@ -625,13 +933,13 @@ let processAlignFile
                     let distFileName = $"{baseName}_dist.xisf"
                     let distPath = Path.Combine(outputDir, distFileName)
 
-                    // Generate distortion heatmap
-                    let distPixels = Array.zeroCreate<byte> (width * height * 3 * 2) // RGB * UInt16
+                    // Generate distortion heatmap (using binned dimensions)
+                    let distPixels = Array.zeroCreate<byte> (widthFinal * heightFinal * 3 * 2) // RGB * UInt16
                     let maxMag = 10.0
 
                     Array.Parallel.iter (fun pixIdx ->
-                        let ox = pixIdx % width
-                        let oy = pixIdx / width
+                        let ox = pixIdx % widthFinal
+                        let oy = pixIdx / widthFinal
                         let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfCoeffs (float ox) (float oy) 5 0.01
                         let dx = float ox - tx
                         let dy = float oy - ty
@@ -644,18 +952,18 @@ let processAlignFile
                         distPixels.[byteIdx + 3] <- byte (g >>> 8)
                         distPixels.[byteIdx + 4] <- byte (b &&& 0xFFus)
                         distPixels.[byteIdx + 5] <- byte (b >>> 8)
-                    ) [| 0 .. width * height - 1 |]
+                    ) [| 0 .. widthFinal * heightFinal - 1 |]
 
                     // Overlay control points
                     match rbfCoeffs with
                     | Some coeffs ->
                         for (cx, cy) in coeffs.ControlPoints do
                             for ch in 0 .. 2 do
-                                paintCircle distPixels width height 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
+                                paintCircle distPixels widthFinal heightFinal 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
                     | None -> ()
 
-                    // Create RGB output image
-                    let distGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
+                    // Create RGB output image (using binned dimensions)
+                    let distGeometry = XisfImageGeometry([| uint32 widthFinal; uint32 heightFinal |], 3u)
                     let distDataBlock = InlineDataBlock(ReadOnlyMemory(distPixels), XisfEncoding.Base64)
                     let distBounds = PixelIO.getBoundsForFormat XisfSampleFormat.UInt16 |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
 
@@ -797,24 +1105,29 @@ let processDistortionFile
 
             let width = int img.Geometry.Width
             let height = int img.Geometry.Height
+            let channels = int img.Geometry.ChannelCount
 
-            if width <> imageWidth || height <> imageHeight then
+            // Calibrate and bin
+            let pixelFloatsRaw = PixelIO.readPixelsAsFloat img
+            let pixelFloats = applyCalibration pixelFloatsRaw masters
+            let (pixelFloatsFinal, widthFinal, heightFinal) =
+                applyBinning pixelFloats width height channels opts.BinFactor opts.BinMethod
+
+            if widthFinal <> imageWidth || heightFinal <> imageHeight then
                 Log.Error($"Image dimensions don't match reference: {fileName}")
                 return false
             else
 
-            // Detect stars
-            let pixelFloats = PixelIO.readPixelsAsFloat img
-            let channels = int img.Geometry.ChannelCount
+            // Detect stars in binned image
             let channel0 =
-                if channels = 1 then pixelFloats
-                else Array.init (width * height) (fun i -> pixelFloats.[i * channels])
+                if channels = 1 then pixelFloatsFinal
+                else Array.init (widthFinal * heightFinal) (fun i -> pixelFloatsFinal.[i * channels])
 
             let mad = calculateChannelMAD channel0
-            let starsResult = StarDetection.detectStarsInChannel channel0 width height mad 0 "Luminance" detectionParams
+            let starsResult = StarDetection.detectStarsInChannel channel0 widthFinal heightFinal mad 0 "Luminance" detectionParams
             let targetStars = starsResult.Stars
 
-            // Run matching
+            // Run matching (use binned dimensions)
             let config = {
                 defaultExpandingConfig with
                     AnchorStars = opts.AnchorStars
@@ -823,7 +1136,7 @@ let processDistortionFile
                     MinAnchorVotes = opts.MinVotes
             }
 
-            let result = matchExpanding refStars targetStars width height config
+            let result = matchExpanding refStars targetStars widthFinal heightFinal config
 
             match result.Transform with
             | None ->
@@ -864,23 +1177,23 @@ let processDistortionFile
                     MaxControlPoints = 500
                 }
 
-                let rbfResult = RBFTransform.setupRBF refStars targetStars (matchedPairs.ToArray()) transform rbfConfig width height
+                let rbfResult = RBFTransform.setupRBF refStars targetStars (matchedPairs.ToArray()) transform rbfConfig widthFinal heightFinal
 
                 // Print console heatmap for analysis if requested
                 if opts.ShowDistortionStats then
-                    printDistortionHeatmap width height transform rbfResult.Coefficients 10
+                    printDistortionHeatmap widthFinal heightFinal transform rbfResult.Coefficients 10
 
-                // Create RGB output for heatmap
+                // Create RGB output for heatmap (using binned dimensions)
                 let outputFormat = XisfSampleFormat.UInt16
-                let pixelCount = width * height
+                let pixelCount = widthFinal * heightFinal
                 let pixels = Array.zeroCreate<byte> (pixelCount * 3 * 2) // RGB * UInt16
 
                 // Sample distortion at each pixel and create heatmap
                 let maxMag = 10.0 // Max distortion for color scale
 
                 Array.Parallel.iter (fun pixIdx ->
-                    let ox = pixIdx % width
-                    let oy = pixIdx / width
+                    let ox = pixIdx % widthFinal
+                    let oy = pixIdx / widthFinal
 
                     let (tx, ty) = RBFTransform.applyFullInverseTransform transform rbfResult.Coefficients (float ox) (float oy) 5 0.01
 
@@ -906,7 +1219,7 @@ let processDistortionFile
                     for (cx, cy) in coeffs.ControlPoints do
                         // Paint white circle
                         for ch in 0 .. 2 do
-                            paintCircle pixels width height 3 ch cx cy 3.0 1.0 outputFormat
+                            paintCircle pixels widthFinal heightFinal 3 ch cx cy 3.0 1.0 outputFormat
                 | None -> ()
 
                 // Create headers
@@ -923,8 +1236,8 @@ let processDistortionFile
                     XisfFitsKeyword("HISTORY", "", "Distortion map by XisfPrep Align") :> XisfCoreElement
                 |]
 
-                // Create RGB output image
-                let geometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
+                // Create RGB output image (using binned dimensions)
+                let geometry = XisfImageGeometry([| uint32 widthFinal; uint32 heightFinal |], 3u)
                 let dataBlock = InlineDataBlock(ReadOnlyMemory(pixels), XisfEncoding.Base64)
                 let bounds = PixelIO.getBoundsForFormat outputFormat |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
 
@@ -1039,11 +1352,64 @@ let showHelp() =
     printfn "  --optimize-dark           Optimize dark scaling for temperature/exposure differences"
     printfn "  --pedestal <value>        Output pedestal [0-65535] (default: 0)"
     printfn ""
+    printfn "Binning (applied after calibration, before star detection):"
+    printfn "  --bin-factor <2-6>        Bin images by NxN factor (default: no binning)"
+    printfn "                              2 - 2x2 binning (4x faster)"
+    printfn "                              3 - 3x3 binning (9x faster)"
+    printfn "                              4 - 4x4 binning (16x faster)"
+    printfn "  --bin-method <method>     Binning method (default: average)"
+    printfn "                              average - Average binning (recommended)"
+    printfn "                              median  - Median binning (robust to outliers)"
+    printfn "                              sum     - Sum binning (adds pixel values)"
+    printfn ""
     printfn "Examples:"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\""
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode detect"
     printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode match --intensity 0.8"
+    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --bin-factor 2  # Quick 2x2 binned alignment"
+    printfn "  xisfprep align -i \"images/*.xisf\" -o \"preview/\" --bin-factor 4 --bin-method median  # Fast preview"
+
+/// Validate align options
+let private validateAlignOptions (opts: AlignOptions) : Result<unit, AlignValidationError> =
+    if String.IsNullOrEmpty opts.Input then
+        Error MissingInput
+    elif String.IsNullOrEmpty opts.Output then
+        Error MissingOutput
+    elif opts.Reference.IsSome && opts.AutoReference then
+        Error ReferenceOptionsConflict
+    elif opts.MaxParallel < 1 then
+        Error (InvalidParallelCount opts.MaxParallel)
+    elif opts.Threshold <= 0.0 then
+        Error (InvalidThreshold opts.Threshold)
+    elif opts.GridSize < 16 then
+        Error (InvalidGridSize opts.GridSize)
+    elif opts.MinFWHM <= 0.0 then
+        Error (InvalidMinFWHM opts.MinFWHM)
+    elif opts.MaxFWHM <= opts.MinFWHM then
+        Error (InvalidMaxFWHM (opts.MinFWHM, opts.MaxFWHM))
+    elif opts.MaxEccentricity < 0.0 || opts.MaxEccentricity > 1.0 then
+        Error (InvalidMaxEccentricity opts.MaxEccentricity)
+    elif opts.MaxStars < 1 then
+        Error (InvalidMaxStars opts.MaxStars)
+    elif opts.RatioTolerance <= 0.0 then
+        Error (InvalidRatioTolerance opts.RatioTolerance)
+    elif opts.MaxStarsTriangles < 3 then
+        Error (InvalidMaxStarsTriangles opts.MaxStarsTriangles)
+    elif opts.MinVotes < 1 then
+        Error (InvalidMinVotes opts.MinVotes)
+    elif opts.Intensity < 0.0 || opts.Intensity > 1.0 then
+        Error (InvalidIntensity opts.Intensity)
+    elif opts.AnchorStars < 4 then
+        Error (InvalidAnchorStars opts.AnchorStars)
+    elif opts.RBFSupportFactor < 1.0 then
+        Error (InvalidRBFSupportFactor opts.RBFSupportFactor)
+    elif opts.RBFRegularization < 0.0 then
+        Error (InvalidRBFRegularization opts.RBFRegularization)
+    elif opts.BinFactor.IsSome && (opts.BinFactor.Value < 2 || opts.BinFactor.Value > 6) then
+        Error (InvalidBinFactor opts.BinFactor.Value)
+    else
+        Ok ()
 
 let parseArgs (args: string array) : AlignOptions =
     let rec parse (args: string list) (opts: AlignOptions) =
@@ -1157,6 +1523,16 @@ let parseArgs (args: string array) : AlignOptions =
             parse rest { opts with OptimizeDark = true }
         | "--pedestal" :: value :: rest ->
             parse rest { opts with OutputPedestal = int value }
+        // Binning
+        | "--bin-factor" :: value :: rest ->
+            parse rest { opts with BinFactor = Some (int value) }
+        | "--bin-method" :: value :: rest ->
+            let method = match value.ToLower() with
+                         | "average" -> Average
+                         | "median" -> Median
+                         | "sum" -> Sum
+                         | _ -> failwithf "Unknown binning method: %s (supported: average, median, sum)" value
+            parse rest { opts with BinMethod = method }
         | arg :: _ ->
             failwithf "Unknown argument: %s" arg
 
@@ -1198,299 +1574,121 @@ let parseArgs (args: string array) : AlignOptions =
         UncalibratedFlat = false
         OptimizeDark = false
         OutputPedestal = 0
+        BinFactor = None
+        BinMethod = Average
     }
 
     let opts = parse (List.ofArray args) defaults
 
-    // Validation
-    if String.IsNullOrEmpty opts.Input then failwith "Required argument: --input"
-    if String.IsNullOrEmpty opts.Output then failwith "Required argument: --output"
+    // Validate align options using structured validation
+    match validateAlignOptions opts with
+    | Error err -> failwith (err.ToString())
+    | Ok () -> ()
 
-    if opts.Reference.IsSome && opts.AutoReference then
-        failwith "--reference and --auto-reference are mutually exclusive"
-
-    if opts.MaxParallel < 1 then failwith "Parallel count must be at least 1"
-    if opts.Threshold <= 0.0 then failwith "Threshold must be positive"
-    if opts.GridSize < 16 then failwith "Grid size must be at least 16"
-    if opts.MinFWHM <= 0.0 then failwith "Min FWHM must be positive"
-    if opts.MaxFWHM <= opts.MinFWHM then failwith "Max FWHM must be greater than min FWHM"
-    if opts.MaxEccentricity < 0.0 || opts.MaxEccentricity > 1.0 then failwith "Max eccentricity must be between 0 and 1"
-    if opts.MaxStars < 1 then failwith "Max stars must be at least 1"
-    if opts.RatioTolerance <= 0.0 then failwith "Ratio tolerance must be positive"
-    if opts.MaxStarsTriangles < 3 then failwith "Max stars for triangles must be at least 3"
-    if opts.MinVotes < 1 then failwith "Min votes must be at least 1"
-    if opts.Intensity < 0.0 || opts.Intensity > 1.0 then failwith "Intensity must be between 0 and 1"
-    if opts.AnchorStars < 4 then failwith "Anchor stars must be at least 4"
-    if opts.RBFSupportFactor < 1.0 then failwith "RBF support factor must be at least 1.0"
-    if opts.RBFRegularization < 0.0 then failwith "RBF regularization must be non-negative"
-
-    // Calibration validation (same as Commands.Calibrate)
-    if opts.BiasFrame.IsSome && opts.BiasLevel.IsSome then
-        failwith "--bias and --bias-level are mutually exclusive"
-    if opts.UncalibratedDark && opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
-        failwith "--uncalibrated-dark requires --bias or --bias-level"
-    if opts.UncalibratedFlat && opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
-        failwith "--uncalibrated-flat requires --bias or --bias-level"
-    if opts.UncalibratedFlat && opts.DarkFrame.IsNone then
-        failwith "--uncalibrated-flat requires --dark"
-    if opts.OptimizeDark then
-        if opts.DarkFrame.IsNone then
-            failwith "--optimize-dark requires --dark"
-        if not opts.UncalibratedDark then
-            failwith "--optimize-dark requires --uncalibrated-dark"
-        if opts.BiasFrame.IsNone && opts.BiasLevel.IsNone then
-            failwith "--optimize-dark requires --bias or --bias-level"
-    if opts.OutputPedestal < 0 || opts.OutputPedestal > 65535 then
-        failwith "Pedestal must be in range [0, 65535]"
+    // Validate calibration configuration using shared validation (if any calibration specified)
+    if opts.BiasFrame.IsSome || opts.BiasLevel.IsSome || opts.DarkFrame.IsSome || opts.FlatFrame.IsSome || opts.OutputPedestal > 0 then
+        let calConfig: CalibrationConfig = {
+            BiasFrame = opts.BiasFrame
+            BiasLevel = opts.BiasLevel
+            DarkFrame = opts.DarkFrame
+            FlatFrame = opts.FlatFrame
+            UncalibratedDark = opts.UncalibratedDark
+            UncalibratedFlat = opts.UncalibratedFlat
+            OptimizeDark = opts.OptimizeDark
+            OutputPedestal = opts.OutputPedestal
+        }
+        match Calibration.validateConfig calConfig with
+        | Error err -> failwith (err.ToString())
+        | Ok () -> ()
 
     opts
 
-let run (args: string array) =
-    let hasHelp = args |> Array.contains "--help" || args |> Array.contains "-h"
+// --- Mode Execution ---
 
-    if hasHelp then
+/// Execute the appropriate processing mode
+let private executeMode (ctx: ProcessingContext) : AsyncResult<ProcessingResult, AlignError> =
+    let opts = ctx.Opts
+    let refData = ctx.Reference
+
+    match opts.OutputMode with
+    | Detect ->
+        let suffix = if opts.Suffix = defaultSuffix then "_det" else opts.Suffix
+        runBatch ctx suffix "detect (star visualization)" (fun f ->
+            processDetectFile
+                f ctx.OutputDirectory suffix opts.Overwrite
+                opts.OutputFormat refData.DetectionParams
+                opts.Intensity refData.Masters opts.BinFactor opts.BinMethod)
+
+    | Match ->
+        let suffix = if opts.Suffix = defaultSuffix then "_mat" else opts.Suffix
+        runBatch ctx suffix "match (correspondence visualization)" (fun f ->
+            processMatchFile
+                f ctx.OutputDirectory suffix opts.Overwrite
+                opts.OutputFormat refData.DetectionParams
+                refData.Stars refData.Triangles
+                opts refData.Masters)
+
+    | Align ->
+        runBatch ctx opts.Suffix "align (image transformation)" (fun f ->
+            processAlignFile
+                f ctx.OutputDirectory opts.Suffix opts.Overwrite
+                refData.DetectionParams refData.Stars refData.Triangles
+                refData.Metadata.FileName refData.Metadata.Width
+                refData.Metadata.Height opts refData.Masters)
+
+    | Distortion ->
+        let suffix = if opts.Suffix = defaultSuffix then "_dist" else opts.Suffix
+        runBatch ctx suffix "distortion (field visualization)" (fun f ->
+            processDistortionFile
+                f ctx.OutputDirectory suffix opts.Overwrite
+                refData.DetectionParams refData.Stars refData.Triangles
+                refData.Metadata.Width refData.Metadata.Height
+                opts refData.Masters)
+
+// --- Main Pipeline ---
+
+/// The main pipeline: pure railway-oriented composition
+let private runPipeline (opts: AlignOptions) : AsyncResult<ProcessingResult, AlignError> =
+    asyncResult {
+        // 1. Validate everything upfront (fail fast)
+        let! files = resolveInputFiles opts.Input
+                     |> Result.mapError InputValidation
+                     |> AsyncResult.ofResult
+        printfn $"Found {files.Length} files"
+        printfn ""
+
+        // 2. Analyze reference image (loads calibration masters internally)
+        let refFile = resolveReferenceFile files opts
+        let! refData = analyzeReference refFile opts
+
+        // 3. Build processing context
+        let ctx = {
+            Opts = opts
+            Files = files
+            OutputDirectory = opts.Output
+            Reference = refData
+        }
+
+        // 4. Execute selected mode
+        return! executeMode ctx
+    }
+
+/// Entry point: handle help and convert Result to exit code
+let run (args: string array) =
+    if args |> Array.exists (fun a -> a = "--help" || a = "-h") then
         showHelp()
         0
     else
-        let computation = async {
-            try
-                let opts = parseArgs args
-
-                // Find input files
-                let inputDir = Path.GetDirectoryName(opts.Input)
-                let pattern = Path.GetFileName(opts.Input)
-                let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
-
-                if not (Directory.Exists(actualDir)) then
-                    Log.Error($"Input directory not found: {actualDir}")
-                    return 1
-                else
-
-                let files = Directory.GetFiles(actualDir, pattern) |> Array.sort
-
-                if files.Length = 0 then
-                    Log.Error($"No files found matching pattern: {opts.Input}")
-                    return 1
-                else
-
-                printfn $"Found {files.Length} files"
-
-                let stopwatch = Stopwatch.StartNew()
-
-                // Determine reference
-                let referenceFile =
-                    match opts.Reference with
-                    | Some r -> r
-                    | None ->
-                        if opts.AutoReference then
-                            printfn "Auto-reference selection not yet implemented, using first file"
-                        files.[0]
-
-                printfn $"Reference: {Path.GetFileName referenceFile}"
-                printfn ""
-
-                // Load reference image
-                let reader = new XisfReader()
-                let! refUnit = reader.ReadAsync(referenceFile) |> Async.AwaitTask
-                let refImage = refUnit.Images.[0]
-
-                let width = int refImage.Geometry.Width
-                let height = int refImage.Geometry.Height
-                let channels = int refImage.Geometry.ChannelCount
-
-                printfn $"Image dimensions: {width}x{height}, {channels} channel(s)"
-
-                // Load calibration masters if configured
-                let! masters =
-                    if opts.BiasFrame.IsSome || opts.DarkFrame.IsSome || opts.FlatFrame.IsSome then
-                        async {
-                            let calConfig: CalibrationConfig = {
-                                BiasFrame = opts.BiasFrame
-                                BiasLevel = opts.BiasLevel
-                                DarkFrame = opts.DarkFrame
-                                FlatFrame = opts.FlatFrame
-                                UncalibratedDark = opts.UncalibratedDark
-                                UncalibratedFlat = opts.UncalibratedFlat
-                                OptimizeDark = opts.OptimizeDark
-                                OutputPedestal = opts.OutputPedestal
-                            }
-                            printfn "Loading calibration masters..."
-                            let! m = loadMasterFrames calConfig
-
-                            // Log what was loaded
-                            match calConfig.BiasFrame with
-                            | Some path -> Log.Information("Master bias: {Path}", Path.GetFileName path)
-                            | None -> ()
-                            match calConfig.DarkFrame with
-                            | Some path -> Log.Information("Master dark: {Path}", Path.GetFileName path)
-                            | None -> ()
-                            match calConfig.FlatFrame with
-                            | Some path -> Log.Information("Master flat: {Path}", Path.GetFileName path)
-                            | None -> ()
-
-                            return Some (m, calConfig)
-                        }
-                    else
-                        async { return None }
-
-                // Get reference pixel data and calibrate
-                let refPixelsRaw = PixelIO.readPixelsAsFloat refImage
-                let refPixels = applyCalibration refPixelsRaw masters
-
-                // Use first channel for star detection
-                let refChannel0 =
-                    if channels = 1 then refPixels
-                    else Array.init (width * height) (fun i -> refPixels.[i * channels])
-
-                let refMAD = calculateChannelMAD refChannel0
-
-                printfn $"Detecting stars in reference (MAD: {refMAD:F2})..."
-
-                // Build detection params from user options
-                let detectionParams: DetectionParams = {
-                    Threshold = opts.Threshold
-                    GridSize = opts.GridSize
-                    MinFWHM = opts.MinFWHM
-                    MaxFWHM = opts.MaxFWHM
-                    MaxEccentricity = opts.MaxEccentricity
-                    MaxStars = Some opts.MaxStars
-                }
-
-                let refStarsResult =
-                    StarDetection.detectStarsInChannel
-                        refChannel0 width height refMAD 0 "Luminance" detectionParams
-
-                let refStars = refStarsResult.Stars
-                printfn $"Reference stars detected: {refStars.Length}"
-
-                if refStars.Length < 10 then
-                    Log.Error("Insufficient stars in reference image (need at least 10)")
-                    return 1
-                else
-
-                // Form triangles from reference stars
-                let refTriangles = formTriangles refStars opts.MaxStarsTriangles
-
-                printfn $"Reference triangles formed: {refTriangles.Length}"
-                printfn ""
-
-                match opts.OutputMode with
-                | Detect ->
-                    // Detect mode: show detected stars
-                    printfn "Output mode: detect (star visualization)"
-                    printfn ""
-
-                    // Create output directory if needed
-                    if not (Directory.Exists(opts.Output)) then
-                        Directory.CreateDirectory(opts.Output) |> ignore
-                        Log.Information($"Created output directory: {opts.Output}")
-
-                    // Use _det suffix for detect mode
-                    let suffix = if opts.Suffix = defaultSuffix then "_det" else opts.Suffix
-
-                    // Process all files in parallel
-                    let tasks = files |> Array.map (fun f ->
-                        processDetectFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams opts.Intensity masters)
-                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
-
-                    let successCount = results |> Array.filter id |> Array.length
-                    let failCount = results.Length - successCount
-
-                    stopwatch.Stop()
-                    let elapsed = stopwatch.Elapsed.TotalSeconds
-                    printfn ""
-                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
-
-                    return if failCount > 0 then 1 else 0
-
-                | Match ->
-                    // Match mode: show star correspondences
-                    printfn "Output mode: match (correspondence visualization)"
-                    printfn ""
-
-                    // Create output directory if needed
-                    if not (Directory.Exists(opts.Output)) then
-                        Directory.CreateDirectory(opts.Output) |> ignore
-                        Log.Information($"Created output directory: {opts.Output}")
-
-                    // Use _mat suffix for match mode
-                    let suffix = if opts.Suffix = defaultSuffix then "_mat" else opts.Suffix
-
-                    // Process all files in parallel
-                    let tasks = files |> Array.map (fun f ->
-                        processMatchFile f opts.Output suffix opts.Overwrite opts.OutputFormat detectionParams refStars refTriangles opts masters)
-                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
-
-                    let successCount = results |> Array.filter id |> Array.length
-                    let failCount = results.Length - successCount
-
-                    stopwatch.Stop()
-                    let elapsed = stopwatch.Elapsed.TotalSeconds
-                    printfn ""
-                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
-
-                    return if failCount > 0 then 1 else 0
-
-                | Align ->
-                    // Align mode: apply transformation
-                    printfn "Output mode: align (image transformation)"
-                    printfn ""
-
-                    // Create output directory if needed
-                    if not (Directory.Exists(opts.Output)) then
-                        Directory.CreateDirectory(opts.Output) |> ignore
-                        Log.Information($"Created output directory: {opts.Output}")
-
-                    let refFileName = Path.GetFileName(referenceFile)
-
-                    // Process all files in parallel
-                    let tasks = files |> Array.map (fun f ->
-                        processAlignFile f opts.Output opts.Suffix opts.Overwrite detectionParams refStars refTriangles refFileName width height opts masters)
-                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
-
-                    let successCount = results |> Array.filter id |> Array.length
-                    let failCount = results.Length - successCount
-
-                    stopwatch.Stop()
-                    let elapsed = stopwatch.Elapsed.TotalSeconds
-                    printfn ""
-                    printfn $"Aligned {successCount} images, {failCount} failed in {elapsed:F1}s"
-
-                    return if failCount > 0 then 1 else 0
-
-                | Distortion ->
-                    // Distortion mode: visualize distortion field
-                    printfn "Output mode: distortion (field visualization)"
-                    printfn ""
-
-                    // Create output directory if needed
-                    if not (Directory.Exists(opts.Output)) then
-                        Directory.CreateDirectory(opts.Output) |> ignore
-                        Log.Information($"Created output directory: {opts.Output}")
-
-                    // Use _dist suffix for distortion mode
-                    let suffix = if opts.Suffix = defaultSuffix then "_dist" else opts.Suffix
-
-                    // Process all files in parallel
-                    let tasks = files |> Array.map (fun f ->
-                        processDistortionFile f opts.Output suffix opts.Overwrite detectionParams refStars refTriangles width height opts masters)
-                    let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
-
-                    let successCount = results |> Array.filter id |> Array.length
-                    let failCount = results.Length - successCount
-
-                    stopwatch.Stop()
-                    let elapsed = stopwatch.Elapsed.TotalSeconds
-                    printfn ""
-                    printfn $"Processed {files.Length} images, wrote {successCount}, {failCount} failed in {elapsed:F1}s"
-
-                    return if failCount > 0 then 1 else 0
-
-            with ex ->
-                Log.Error($"Error: {ex.Message}")
+        parseArgs args
+        |> runPipeline
+        |> Async.map (function
+            | Ok result ->
+                // Success - exit cleanly (failed files already reported)
+                if result.FailedCount > 0 then 1 else 0
+            | Error err ->
+                // Log structured error and return exit code
+                Log.Error(err.ToString())
                 printfn ""
                 printfn "Run 'xisfprep align --help' for usage information"
-                return 1
-        }
-
-        Async.RunSynchronously computation
+                1)
+        |> Async.RunSynchronously

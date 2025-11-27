@@ -6,6 +6,23 @@ open Serilog
 open XisfLib.Core
 open Algorithms.Statistics
 open Algorithms.Calibration
+open Algorithms.InputValidation
+open FsToolkit.ErrorHandling
+
+type AsyncResult<'T, 'E> = Async<Result<'T, 'E>>
+
+type IntegrateError =
+    | OutputExists of path: string
+    | InputValidation of InputValidationError
+    | InsufficientFiles of count: int
+    | CalibrationFailed of CalibrationError
+
+    override this.ToString() =
+        match this with
+        | OutputExists path -> $"Output file already exists: {path} (use --overwrite to replace)"
+        | InputValidation err -> err.ToString()
+        | InsufficientFiles count -> $"No files found to integrate"
+        | CalibrationFailed err -> $"Failed to load calibration masters: {err}"
 
 // --- Type Definitions ---
 
@@ -189,19 +206,7 @@ let parseArgs (args: string array) =
             if iterations < 1 then
                 failwith "Iterations must be at least 1"
 
-            // Inline calibration validation
-            if state.BiasFrame.IsSome && state.BiasLevel.IsSome then
-                failwith "--bias and --bias-level are mutually exclusive"
-
-            if state.UncalibratedDark && state.DarkFrame.IsNone then
-                failwith "--uncalibrated-dark requires --dark"
-
-            if state.UncalibratedDark && state.BiasFrame.IsNone && state.BiasLevel.IsNone then
-                failwith "--uncalibrated-dark requires --bias or --bias-level"
-
             let pedestal = state.Pedestal |> Option.defaultValue 0
-            if pedestal < 0 || pedestal > 65535 then
-                failwith "Pedestal must be in range [0, 65535]"
 
             // Build the final settings record
             let settings = {
@@ -215,7 +220,7 @@ let parseArgs (args: string array) =
             // Build calibration config for Algorithms.Calibration
             let calibrationConfig =
                 if state.BiasFrame.IsSome || state.BiasLevel.IsSome || state.DarkFrame.IsSome || pedestal > 0 then
-                    Some {
+                    let config = {
                         BiasFrame = state.BiasFrame
                         BiasLevel = state.BiasLevel
                         DarkFrame = state.DarkFrame
@@ -225,6 +230,11 @@ let parseArgs (args: string array) =
                         OptimizeDark = false  // Not used in integrate
                         OutputPedestal = pedestal
                     }
+                    // Validate using shared validation
+                    match validateConfig config with
+                    | Error err -> failwith (err.ToString())
+                    | Ok () -> ()
+                    Some config
                 else
                     None
 
@@ -657,6 +667,18 @@ let processPixel
                     sorted.[mid]
     )
 
+let private setupCalibration (config: CalibrationConfig option) : AsyncResult<MasterFrames option, IntegrateError> =
+    asyncResult {
+        match config with
+        | Some config ->
+            Log.Information("Loading master calibration frames for inline calibration")
+            let! masters = loadMasterFrames config
+                           |> AsyncResult.mapError CalibrationFailed
+            return Some masters
+        | None ->
+            return None
+    }
+
 let run (args: string array) =
     let hasHelp = args |> Array.contains "--help" || args |> Array.contains "-h"
 
@@ -679,45 +701,23 @@ let run (args: string array) =
 
                 Log.Information("Starting image integration")
 
-                // Load inline calibration masters if configured
-                let! inlineMasters =
-                    match inlineCalConfig with
-                    | Some config ->
-                        async {
-                            Log.Information("Loading master calibration frames for inline calibration")
-                            let! masters = loadMasterFrames config
-                            return Some masters
-                        }
-                    | None -> async { return None }
+                // Resolve input files using shared validation
+                let filesResult = resolveInputFiles inputPattern
+                                  |> Result.mapError InputValidation
 
-                // Find input files
-                let files =
-                    if inputPattern.StartsWith("@") then
-                        // Read file list from text file
-                        let listPath = inputPattern.Substring(1)
-                        if not (File.Exists(listPath)) then
-                            Log.Error($"File list not found: {listPath}")
-                            [||]
-                        else
-                            File.ReadAllLines(listPath)
-                            |> Array.filter (fun line -> not (String.IsNullOrWhiteSpace(line)))
-                            |> Array.sort
-                    else
-                        // Use glob pattern
-                        let inputDir = Path.GetDirectoryName(inputPattern)
-                        let pattern = Path.GetFileName(inputPattern)
-                        let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
-
-                        if not (Directory.Exists(actualDir)) then
-                            Log.Error($"Input directory not found: {actualDir}")
-                            [||]
-                        else
-                            Directory.GetFiles(actualDir, pattern) |> Array.sort
-
-                if files.Length = 0 then
-                    Log.Error($"No files found matching pattern: {inputPattern}")
+                match filesResult with
+                | Error err ->
+                    Log.Error(err.ToString())
                     return 1
-                else
+                | Ok files ->
+
+                let! mastersResult = setupCalibration inlineCalConfig
+
+                match mastersResult with
+                | Error err ->
+                    Log.Error(err.ToString())
+                    return 1
+                | Ok inlineMasters ->
 
                 // Validate minimum image count for rejection
                 match settings.Rejection with

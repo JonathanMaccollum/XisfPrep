@@ -5,7 +5,22 @@ open System.IO
 open Serilog
 open XisfLib.Core
 open Algorithms.Calibration
+open Algorithms.InputValidation
 open Algorithms.Statistics
+open FsToolkit.ErrorHandling
+
+type AsyncResult<'T, 'E> = Async<Result<'T, 'E>>
+
+type CalibrateError =
+    | InputValidation of InputValidationError
+    | CalibrationFailed of CalibrationError
+    | ValidationFailed of string
+
+    override this.ToString() =
+        match this with
+        | InputValidation err -> err.ToString()
+        | CalibrationFailed err -> err.ToString()
+        | ValidationFailed msg -> msg
 
 // --- Defaults ---
 let private defaultPedestal = 0
@@ -80,6 +95,19 @@ let showHelp() =
     printfn "  # Pedestal only (shift histogram)"
     printfn "  xisfprep calibrate -i \"lights/*.xisf\" -o \"adjusted/\" --pedestal 100"
 
+/// Convert command config to calibration config
+let toCalibrationConfig (config: CalibrateCommandConfig) : CalibrationConfig =
+    {
+        BiasFrame = config.BiasFrame
+        BiasLevel = config.BiasLevel
+        DarkFrame = config.DarkFrame
+        FlatFrame = config.FlatFrame
+        UncalibratedDark = config.UncalibratedDark
+        UncalibratedFlat = config.UncalibratedFlat
+        OptimizeDark = config.OptimizeDark
+        OutputPedestal = config.OutputPedestal
+    }
+
 let parseArgs (args: string array) : CalibrateCommandConfig =
     let rec parse (args: string list) (cfg: CalibrateCommandConfig) =
         match args with
@@ -143,49 +171,19 @@ let parseArgs (args: string array) : CalibrateCommandConfig =
     if String.IsNullOrEmpty cfg.InputPattern then failwith "Required argument: --input"
     if String.IsNullOrEmpty cfg.OutputDir then failwith "Required argument: --output"
 
-    if cfg.BiasFrame.IsSome && cfg.BiasLevel.IsSome then
-        failwith "--bias and --bias-level are mutually exclusive"
-
     if cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone && cfg.DarkFrame.IsNone && cfg.FlatFrame.IsNone && cfg.OutputPedestal = 0 then
         failwith "At least one of --bias, --bias-level, --dark, --flat, or --pedestal required"
-
-    if cfg.UncalibratedDark && cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone then
-        failwith "--uncalibrated-dark requires --bias or --bias-level"
-
-    if cfg.UncalibratedFlat && cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone then
-        failwith "--uncalibrated-flat requires --bias or --bias-level"
-
-    if cfg.UncalibratedFlat && cfg.DarkFrame.IsNone then
-        failwith "--uncalibrated-flat requires --dark"
-
-    if cfg.OptimizeDark then
-        if cfg.DarkFrame.IsNone then
-            failwith "--optimize-dark requires --dark"
-        if not cfg.UncalibratedDark then
-            failwith "--optimize-dark requires --uncalibrated-dark (dark frame must be raw/uncalibrated)"
-        if cfg.BiasFrame.IsNone && cfg.BiasLevel.IsNone then
-            failwith "--optimize-dark requires --bias or --bias-level"
-
-    if cfg.OutputPedestal < 0 || cfg.OutputPedestal > 65535 then
-        failwith "Pedestal must be in range [0, 65535]"
 
     if cfg.MaxParallel < 1 then
         failwith "Parallel count must be at least 1"
 
-    cfg
+    // Validate calibration configuration using shared validation
+    let calConfig = toCalibrationConfig cfg
+    match validateConfig calConfig with
+    | Error err -> failwith (err.ToString())
+    | Ok () -> ()
 
-/// Convert command config to calibration config
-let toCalibrationConfig (config: CalibrateCommandConfig) : CalibrationConfig =
-    {
-        BiasFrame = config.BiasFrame
-        BiasLevel = config.BiasLevel
-        DarkFrame = config.DarkFrame
-        FlatFrame = config.FlatFrame
-        UncalibratedDark = config.UncalibratedDark
-        UncalibratedFlat = config.UncalibratedFlat
-        OptimizeDark = config.OptimizeDark
-        OutputPedestal = config.OutputPedestal
-    }
+    cfg
 
 let logClippingWarnings (zeroCount: int) (flatZeroCount: int) (pixelCount: int) =
     let totalPixels = float pixelCount
@@ -341,71 +339,56 @@ let run (args: string array) =
             try
                 let config = parseArgs args
 
-                let inputDir = Path.GetDirectoryName(config.InputPattern)
-                let pattern = Path.GetFileName(config.InputPattern)
-                let actualDir = if String.IsNullOrEmpty(inputDir) then "." else inputDir
+                // Resolve input files using shared validation
+                let filesResult = resolveInputFiles config.InputPattern
+                                  |> Result.mapError InputValidation
 
-                if not (Directory.Exists(actualDir)) then
-                    Log.Error("Input directory not found: {Dir}", actualDir)
+                match filesResult with
+                | Error err ->
+                    Log.Error(err.ToString())
+                    return 1
+                | Ok files ->
+
+                let plural = if files.Length = 1 then "" else "s"
+                let mode = if config.DryRun then " [DRY RUN]" else ""
+                printfn "Found %d file%s to calibrate%s" files.Length plural mode
+
+                // Load calibration masters
+                let calConfig = toCalibrationConfig config
+                let! mastersResult = loadMasterFrames calConfig
+                                     |> AsyncResult.mapError CalibrationFailed
+
+                match mastersResult with
+                | Error err ->
+                    Log.Error(err.ToString())
+                    return 1
+                | Ok masters ->
+
+                // Create output directory
+                if not config.DryRun && not (Directory.Exists(config.OutputDir)) then
+                    Directory.CreateDirectory(config.OutputDir) |> ignore
+                    Log.Information("Created output directory: {Dir}", config.OutputDir)
+
+                // Process files in parallel
+                let! results =
+                    files
+                    |> Array.map (fun file -> processFile file masters config)
+                    |> Async.Parallel
+
+                let successes = results |> Array.filter (function Ok _ -> true | Error _ -> false)
+                let failures = results |> Array.filter (function Error _ -> true | Ok _ -> false)
+
+                printfn ""
+                if config.DryRun then
+                    printfn "Dry run complete - no files were modified"
+                else
+                    printfn "Successfully calibrated %d of %d file%s" successes.Length files.Length plural
+
+                if failures.Length > 0 then
+                    printfn "Failed to process %d file%s" failures.Length (if failures.Length = 1 then "" else "s")
                     return 1
                 else
-                    let files = Directory.GetFiles(actualDir, pattern) |> Array.sort
-
-                    if files.Length = 0 then
-                        Log.Error("No files found matching pattern: {Pattern}", config.InputPattern)
-                        return 1
-                    else
-                        let plural = if files.Length = 1 then "" else "s"
-                        let mode = if config.DryRun then " [DRY RUN]" else ""
-                        printfn "Found %d file%s to calibrate%s" files.Length plural mode
-
-                        // Load master frames using Algorithms.Calibration
-                        let calConfig = toCalibrationConfig config
-                        let! masters = loadMasterFrames calConfig
-
-                        // Log what was loaded
-                        match calConfig.BiasFrame with
-                        | Some path -> Log.Information("Master bias: {Path}", path)
-                        | None -> ()
-                        match calConfig.BiasLevel with
-                        | Some level -> Log.Information("Bias level: {Level}", level)
-                        | None -> ()
-                        match calConfig.DarkFrame with
-                        | Some path -> Log.Information("Master dark: {Path}", path)
-                        | None -> ()
-                        match calConfig.FlatFrame with
-                        | Some path ->
-                            Log.Information("Master flat: {Path}", path)
-                            match masters.FlatMedian with
-                            | Some median -> Log.Information("Flat median: {Median:F2}", median)
-                            | None -> ()
-                        | None -> ()
-
-                        // Create output directory
-                        if not config.DryRun && not (Directory.Exists(config.OutputDir)) then
-                            Directory.CreateDirectory(config.OutputDir) |> ignore
-                            Log.Information("Created output directory: {Dir}", config.OutputDir)
-
-                        // Process files in parallel
-                        let! results =
-                            files
-                            |> Array.map (fun file -> processFile file masters config)
-                            |> Async.Parallel
-
-                        let successes = results |> Array.filter (function Ok _ -> true | Error _ -> false)
-                        let failures = results |> Array.filter (function Error _ -> true | Ok _ -> false)
-
-                        printfn ""
-                        if config.DryRun then
-                            printfn "Dry run complete - no files were modified"
-                        else
-                            printfn "Successfully calibrated %d of %d file%s" successes.Length files.Length plural
-
-                        if failures.Length > 0 then
-                            printfn "Failed to process %d file%s" failures.Length (if failures.Length = 1 then "" else "s")
-                            return 1
-                        else
-                            return 0
+                    return 0
             with ex ->
                 Log.Error("Error: {Message}", ex.Message)
                 printfn ""

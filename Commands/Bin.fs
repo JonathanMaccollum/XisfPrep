@@ -4,17 +4,7 @@ open System
 open System.IO
 open Serilog
 open XisfLib.Core
-
-type BinningMethod =
-    | Average
-    | Median
-    | Sum
-
-    member this.Description =
-        match this with
-        | Average -> "Average binning (preserves flux)"
-        | Median -> "Median binning (robust to outliers)"
-        | Sum -> "Sum binning (adds pixel values)"
+open Algorithms.Binning
 
 // --- Defaults ---
 let private defaultFactor = 2
@@ -33,6 +23,13 @@ type BinOptions = {
     MaxParallel: int
     OutputFormat: XisfSampleFormat option
 }
+
+/// Convert command options to binning config
+let toBinningConfig (opts: BinOptions) : BinningConfig =
+    {
+        Factor = opts.Factor
+        Method = opts.Method
+    }
 
 let showHelp() =
     printfn "bin - Downsample images by binning pixels together"
@@ -114,69 +111,15 @@ let parseArgs (args: string array) : BinOptions =
 
     if String.IsNullOrEmpty opts.Input then failwith "Required argument: --input"
     if String.IsNullOrEmpty opts.Output then failwith "Required argument: --output"
-    if opts.Factor < 2 || opts.Factor > 6 then failwith "Binning factor must be between 2 and 6"
     if opts.MaxParallel < 1 then failwith "Parallel count must be at least 1"
 
+    // Validate binning configuration using shared validation
+    let binConfig = toBinningConfig opts
+    match validateConfig binConfig with
+    | Error err -> failwith (err.ToString())
+    | Ok () -> ()
+
     opts
-
-let applyBinningMethod (pixels: float array) (method: BinningMethod) =
-    if Array.isEmpty pixels then 0.0
-    else
-        match method with
-        | Average ->
-            Array.average pixels
-        | Median ->
-            let sorted = pixels |> Array.sort
-            let mid = sorted.Length / 2
-            if sorted.Length % 2 = 0 then
-                (sorted.[mid - 1] + sorted.[mid]) / 2.0
-            else
-                sorted.[mid]
-        | Sum ->
-            Array.sum pixels |> min 65535.0
-
-let createBinnedData (img: XisfImage) width height channels factor (method: BinningMethod) (outputFormat: XisfSampleFormat) (normalize: bool) =
-    // Read pixels as float using PixelIO (handles all sample formats)
-    let pixelFloats = PixelIO.readPixelsAsFloat img
-
-    let newWidth = width / factor
-    let newHeight = height / factor
-
-    let getPixel x y channel =
-        let offset = (y * width + x) * channels + channel
-        pixelFloats.[offset]
-
-    let binnedFloats = Array.zeroCreate (newWidth * newHeight * channels)
-
-    // Pre-allocate one array for the binning block and reuse it
-    let blockPixels = Array.zeroCreate (factor * factor)
-
-    for newY = 0 to newHeight - 1 do
-        for newX = 0 to newWidth - 1 do
-            for ch = 0 to channels - 1 do
-                let mutable pixelCount = 0
-                for dy in 0 .. factor - 1 do
-                    for dx in 0 .. factor - 1 do
-                        let srcX = newX * factor + dx
-                        let srcY = newY * factor + dy
-                        if srcX < width && srcY < height then
-                            blockPixels.[pixelCount] <- getPixel srcX srcY ch
-                            pixelCount <- pixelCount + 1
-
-                let binnedValue =
-                    if pixelCount = 0 then 0.0
-                    else
-                        applyBinningMethod blockPixels.[0 .. pixelCount - 1] method
-
-                let offset = (newY * newWidth + newX) * channels + ch
-                binnedFloats.[offset] <- binnedValue
-
-    // Write output in requested format (preserves input format by default)
-    PixelIO.writePixelsFromFloat binnedFloats outputFormat normalize
-
-let validateDimensions width height factor =
-    if width % factor <> 0 || height % factor <> 0 then
-        Log.Warning($"Image dimensions ({width}x{height}) not divisible by factor {factor} - will truncate")
 
 let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight channels factor (method: BinningMethod) (outputFormat: XisfSampleFormat) =
     let newGeometry = XisfImageGeometry([| uint32 newWidth; uint32 newHeight |], uint32 channels)
@@ -212,7 +155,7 @@ let createOutputImage (img: XisfImage) (binnedData: byte[]) newWidth newHeight c
         updatedFits
     )
 
-let binImage (inputPath: string) (outputDir: string) (factor: int) (method: BinningMethod) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) : Async<bool> =
+let binImage (inputPath: string) (outputDir: string) (binConfig: BinningConfig) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) : Async<bool> =
     async {
         try
             let fileName = Path.GetFileName(inputPath)
@@ -236,31 +179,41 @@ let binImage (inputPath: string) (outputDir: string) (factor: int) (method: Binn
             let height = int img.Geometry.Height
             let channels = int img.Geometry.ChannelCount
 
-            validateDimensions width height factor
+            // Validate dimensions using shared validation
+            match validateDimensions width height channels binConfig.Factor with
+            | Error err ->
+                Log.Error(err.ToString())
+                return false
+            | Ok _truncated ->
+                // Warning already logged by validateDimensions if needed
 
-            let newWidth = width / factor
-            let newHeight = height / factor
+                // Read pixels as float using PixelIO (handles all sample formats)
+                let pixelFloats = PixelIO.readPixelsAsFloat img
 
-            // Determine output format (use override or preserve input format)
-            let (outputFormat, normalize) =
-                match outputFormatOverride with
-                | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
-                | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
+                // Apply binning using algorithm module
+                let binResult = binPixels pixelFloats width height channels binConfig
 
-            let binnedData = createBinnedData img width height channels factor method outputFormat normalize
+                // Determine output format (use override or preserve input format)
+                let (outputFormat, normalize) =
+                    match outputFormatOverride with
+                    | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
+                    | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
 
-            let binnedImage = createOutputImage img binnedData newWidth newHeight channels factor method outputFormat
+                // Convert binned floats to output format
+                let binnedData = PixelIO.writePixelsFromFloat binResult.BinnedPixels outputFormat normalize
 
-            let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Bin v1.0")
-            let outUnit = XisfFactory.CreateMonolithic(metadata, binnedImage)
+                let binnedImage = createOutputImage img binnedData binResult.NewWidth binResult.NewHeight binResult.NewChannels binConfig.Factor binConfig.Method outputFormat
 
-            let writer = new XisfWriter()
-            do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
+                let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Bin v1.0")
+                let outUnit = XisfFactory.CreateMonolithic(metadata, binnedImage)
 
-            let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
-            printfn $"  -> {outFileName} ({sizeMB} MB, {newWidth}x{newHeight})"
+                let writer = new XisfWriter()
+                do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
 
-            return true
+                let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
+                printfn $"  -> {outFileName} ({sizeMB} MB, {binResult.NewWidth}x{binResult.NewHeight})"
+
+                return true
         with ex ->
             Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
             return false
@@ -301,8 +254,9 @@ let run (args: string array) =
                         printfn ""
 
                         // Process all files in parallel with max parallelism limit
+                        let binConfig = toBinningConfig opts
                         let tasks = files |> Array.map (fun f ->
-                            binImage f opts.Output opts.Factor opts.Method opts.Suffix opts.Overwrite opts.OutputFormat)
+                            binImage f opts.Output binConfig opts.Suffix opts.Overwrite opts.OutputFormat)
                         let! results = Async.Parallel(tasks, maxDegreeOfParallelism = opts.MaxParallel)
 
                         let successCount = results |> Array.filter id |> Array.length
