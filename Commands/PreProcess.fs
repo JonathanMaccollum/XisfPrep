@@ -1,4 +1,4 @@
-module Commands.Align2
+module Commands.PreProcess
 
 open System
 open System.Diagnostics
@@ -76,7 +76,7 @@ let private defaultDistortion = NoDistortion
 let private defaultRBFSupportFactor = 3.0
 let private defaultRBFRegularization = 1e-6
 
-type AlignOptions = {
+type PreProcessOptions = {
     Input: string
     Output: string
     Reference: string option
@@ -126,7 +126,7 @@ type AlignOptions = {
     BinMethod: BinningMethod
 }
 
-type AlignValidationError =
+type PreProcessValidationError =
     | MissingInput
     | MissingOutput
     | ReferenceOptionsConflict
@@ -168,7 +168,7 @@ type AlignValidationError =
         | InvalidBinFactor value -> $"Bin factor must be between 2 and 6, got {value}"
 
 type RunError =
-    | ValidationFailed of AlignValidationError
+    | ValidationFailed of PreProcessValidationError
     | CalibrationValidationFailed of Algorithms.Calibration.CalibrationValidationError
     | InputResolutionFailed of InputValidationError
     | MasterLoadFailed of string
@@ -218,7 +218,7 @@ type ReferenceData = {
     DetectionParams: DetectionParams
 }
 
-let validateAlignOptions (opts: AlignOptions) : Result<unit, AlignValidationError> =
+let validatePreProcessOptions (opts: PreProcessOptions) : Result<unit, PreProcessValidationError> =
     if String.IsNullOrEmpty opts.Input then
         Error MissingInput
     elif String.IsNullOrEmpty opts.Output then
@@ -258,7 +258,7 @@ let validateAlignOptions (opts: AlignOptions) : Result<unit, AlignValidationErro
     else
         Ok ()
 
-let validateCalibrationConfig (opts: AlignOptions) : Result<unit, Algorithms.Calibration.CalibrationValidationError> =
+let validateCalibrationConfig (opts: PreProcessOptions) : Result<unit, Algorithms.Calibration.CalibrationValidationError> =
     if opts.BiasFrame.IsNone && opts.BiasLevel.IsNone && opts.DarkFrame.IsNone && opts.FlatFrame.IsNone then
         Ok ()
     else
@@ -280,7 +280,7 @@ let validateReferenceStars (count: int) : Result<unit, string> =
     else
         Ok ()
 
-let resolveReferenceFile (files: string[]) (opts: AlignOptions) : string =
+let resolveReferenceFile (files: string[]) (opts: PreProcessOptions) : string =
     match opts.Reference with
     | Some r -> r
     | None ->
@@ -288,8 +288,8 @@ let resolveReferenceFile (files: string[]) (opts: AlignOptions) : string =
             printfn "Auto-reference selection not yet implemented, using first file"
         files.[0]
 
-let parseArgs (args: string array) : AlignOptions =
-    let rec parse (args: string list) (opts: AlignOptions) =
+let parseArgs (args: string array) : PreProcessOptions =
+    let rec parse (args: string list) (opts: PreProcessOptions) =
         match args with
         | [] -> opts
         | "--input" :: value :: rest | "-i" :: value :: rest ->
@@ -628,7 +628,7 @@ let applyTransform
 
 let buildPipelineConfigs
     (mode: OutputMode)
-    (opts: AlignOptions)
+    (opts: PreProcessOptions)
     (masters: (MasterFrames * Algorithms.Calibration.CalibrationConfig) option)
     (refData: ReferenceData)
     : PipelineConfigs =
@@ -824,7 +824,7 @@ let writeOutputFile (path: string) (image: XisfImage) : Async<Result<unit, strin
             return Error ex.Message
     }
 
-let loadCalibrationMasters (opts: AlignOptions)
+let loadCalibrationMasters (opts: PreProcessOptions)
     : Async<Result<(MasterFrames * Algorithms.Calibration.CalibrationConfig) option, string>> =
     async {
         if opts.BiasFrame.IsNone && opts.BiasLevel.IsNone && opts.DarkFrame.IsNone && opts.FlatFrame.IsNone then
@@ -895,293 +895,6 @@ let analyzeReference
                     }
                 )
             )
-    }
-
-let processDetectMode
-    (inputPath: string)
-    (outputPath: string)
-    (masters: (MasterFrames * Algorithms.Calibration.CalibrationConfig) option)
-    (binConfig: BinningConfig)
-    (detConfig: DetectionConfig)
-    (intensity: float)
-    (outputFormat: XisfSampleFormat option)
-    : Async<Result<unit, PipelineError>> =
-
-    asyncResult {
-        let! img = loadImage inputPath |> AsyncResult.mapError LoadFailed
-        let! preprocessed = preprocessImage masters binConfig img |> AsyncResult.ofResult
-
-        let detected = Alignment.detect detConfig preprocessed
-
-        // Read original XISF for metadata
-        let reader = new XisfReader()
-        let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-        let originalImg = unit.Images.[0]
-
-        // Generate output
-        let format = outputFormat |> Option.defaultValue originalImg.SampleFormat
-        let pixels = generateDetectOutput detected intensity format
-
-        // Create XISF output
-        let headers = [|
-            XisfFitsKeyword("STARCOUNT", detected.Stars.Length.ToString(), "Number of detected stars") :> XisfCoreElement
-            XisfFitsKeyword("STARTHRES", sprintf "%.1f" detConfig.Threshold, "Detection threshold (sigma)") :> XisfCoreElement
-            XisfFitsKeyword("STARGRID", detConfig.GridSize.ToString(), "Background grid size") :> XisfCoreElement
-            XisfFitsKeyword("HISTORY", "", "Star detection by XisfPrep Align (detect mode)") :> XisfCoreElement
-        |]
-
-        let outputImage =
-            createOutputImage originalImg pixels detected.Image.Width detected.Image.Height
-                detected.Image.Channels format headers
-
-        do! writeOutputFile outputPath outputImage |> AsyncResult.mapError SaveFailed
-
-        printfn $"  {detected.Stars.Length} stars -> {Path.GetFileName outputPath}"
-    }
-
-/// Process single file in align mode
-let processAlignMode
-    (inputPath: string)
-    (outputPath: string)
-    (masters: (MasterFrames * Algorithms.Calibration.CalibrationConfig) option)
-    (binConfig: BinningConfig)
-    (detConfig: DetectionConfig)
-    (matchConfig: MatchingConfig)
-    (distConfig: DistortionConfig option)
-    (transConfig: TransformConfig)
-    (refFileName: string)
-    (refWidth: int)
-    (refHeight: int)
-    (intensity: float)
-    (includeDetectionModel: bool)
-    (includeDistortionModel: bool)
-    : Async<Result<unit, PipelineError>> =
-
-    asyncResult {
-        let fileName = Path.GetFileName inputPath
-        let baseName = Path.GetFileNameWithoutExtension inputPath
-        let outputDir = Path.GetDirectoryName outputPath
-
-        let! img = loadImage inputPath |> AsyncResult.mapError LoadFailed
-        let! preprocessed = preprocessImage masters binConfig img |> AsyncResult.ofResult
-
-        let detected = Alignment.detect detConfig preprocessed
-
-        // Verify dimensions match reference (after binning)
-        if detected.Image.Width <> refWidth || detected.Image.Height <> refHeight then
-            return! Error (DetectionFailed $"Image dimensions {detected.Image.Width}x{detected.Image.Height} don't match reference {refWidth}x{refHeight}")
-
-        let! matched = Alignment.matchToReference matchConfig fileName detected |> AsyncResult.ofResult |> AsyncResult.mapError MatchingFailed
-
-        let (matched', rbfResult) = Alignment.computeDistortion distConfig matched
-        let rbfCoeffs = rbfResult |> Option.bind (fun r -> r.Coefficients)
-
-        let! transformed = Alignment.transform transConfig (matched', rbfCoeffs) |> AsyncResult.ofResult |> AsyncResult.mapError TransformFailed
-
-        // Read original XISF for metadata
-        let reader = new XisfReader()
-        let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-        let originalImg = unit.Images.[0]
-
-        // Generate output
-        let pixels = generateAlignOutput transformed
-
-        // Create headers
-        let interpName =
-            match transConfig.Interpolation with
-            | Nearest -> "nearest"
-            | Bilinear -> "bilinear"
-            | Bicubic -> "bicubic"
-            | Lanczos3 -> "lanczos3"
-
-        let headers = [|
-            XisfFitsKeyword("ALIGNED", "T", "Image has been aligned") :> XisfCoreElement
-            XisfFitsKeyword("ALIGNREF", refFileName, "Reference frame") :> XisfCoreElement
-            XisfFitsKeyword("XSHIFT", sprintf "%.2f" matched.Transform.Dx, "X shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("YSHIFT", sprintf "%.2f" matched.Transform.Dy, "Y shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("ROTATION", sprintf "%.4f" matched.Transform.Rotation, "Rotation (degrees)") :> XisfCoreElement
-            XisfFitsKeyword("SCALE", sprintf "%.6f" matched.Transform.Scale, "Scale factor") :> XisfCoreElement
-            XisfFitsKeyword("STARMTCH", matched.MatchedPairs.Length.ToString(), "Matched star pairs") :> XisfCoreElement
-            XisfFitsKeyword("INTERP", interpName, "Interpolation method") :> XisfCoreElement
-            XisfFitsKeyword("HISTORY", "", "Aligned by XisfPrep Align v1.0") :> XisfCoreElement
-        |]
-
-        let outputImage =
-            createOutputImage originalImg pixels transformed.Width transformed.Height
-                transformed.Channels XisfSampleFormat.Float32 headers
-
-        do! writeOutputFile outputPath outputImage |> AsyncResult.mapError SaveFailed
-
-        // Write detection model if requested
-        if includeDetectionModel then
-            let detFileName = $"{baseName}_det.xisf"
-            let detPath = Path.Combine(outputDir, detFileName)
-            let detPixels = createBlackPixels detected.Image.Width detected.Image.Height detected.Image.Channels XisfSampleFormat.UInt16
-
-            for star in detected.Stars do
-                let radius = star.FWHM * 2.0
-                for ch in 0 .. detected.Image.Channels - 1 do
-                    Painting.paintCircle detPixels detected.Image.Width detected.Image.Height detected.Image.Channels ch star.X star.Y radius intensity XisfSampleFormat.UInt16
-
-            let detHeaders = [|
-                XisfFitsKeyword("STARCOUNT", detected.Stars.Length.ToString(), "Number of detected stars") :> XisfCoreElement
-                XisfFitsKeyword("STARTHRES", sprintf "%.1f" detConfig.Threshold, "Detection threshold (sigma)") :> XisfCoreElement
-                XisfFitsKeyword("STARGRID", detConfig.GridSize.ToString(), "Background grid size") :> XisfCoreElement
-            |]
-
-            let detOutputImage =
-                createOutputImage originalImg detPixels detected.Image.Width detected.Image.Height
-                    detected.Image.Channels XisfSampleFormat.UInt16 detHeaders
-
-            do! writeOutputFile detPath detOutputImage |> AsyncResult.mapError SaveFailed
-
-        // Write distortion model if requested
-        if includeDistortionModel && rbfCoeffs.IsSome then
-            let distFileName = $"{baseName}_dist.xisf"
-            let distPath = Path.Combine(outputDir, distFileName)
-
-            let width = detected.Image.Width
-            let height = detected.Image.Height
-            let pixelCount = width * height
-            let distPixels = Array.zeroCreate<byte> (pixelCount * 3 * 2) // RGB * UInt16
-            let maxMag = 10.0
-
-            Array.Parallel.iter (fun pixIdx ->
-                let ox = pixIdx % width
-                let oy = pixIdx / width
-                let (tx, ty) = RBFTransform.applyFullInverseTransform matched.Transform rbfCoeffs (float ox) (float oy) 5 0.01
-                let dx = float ox - tx
-                let dy = float oy - ty
-                let mag = sqrt (dx * dx + dy * dy)
-                let (r, g, b) = magnitudeToColor mag maxMag
-
-                let byteIdx = pixIdx * 6
-                distPixels.[byteIdx] <- byte (r &&& 0xFFus)
-                distPixels.[byteIdx + 1] <- byte (r >>> 8)
-                distPixels.[byteIdx + 2] <- byte (g &&& 0xFFus)
-                distPixels.[byteIdx + 3] <- byte (g >>> 8)
-                distPixels.[byteIdx + 4] <- byte (b &&& 0xFFus)
-                distPixels.[byteIdx + 5] <- byte (b >>> 8)
-            ) [| 0 .. pixelCount - 1 |]
-
-            // Overlay control points
-            match rbfCoeffs with
-            | Some coeffs ->
-                for (cx, cy) in coeffs.ControlPoints do
-                    for ch in 0 .. 2 do
-                        Painting.paintCircle distPixels width height 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
-            | None -> ()
-
-            // Create RGB output
-            let geometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
-            let dataBlock = InlineDataBlock(ReadOnlyMemory(distPixels), XisfEncoding.Base64)
-            let bounds = PixelIO.getBoundsForFormat XisfSampleFormat.UInt16 |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
-
-            let distOutputImage = XisfImage(
-                geometry, XisfSampleFormat.UInt16, XisfColorSpace.RGB, dataBlock, bounds,
-                originalImg.PixelStorage, originalImg.ImageType, 0.0,
-                originalImg.Orientation, "", Nullable<Guid>(),
-                originalImg.Properties, [||]
-            )
-
-            let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align v1.0")
-            let outUnit = XisfFactory.CreateMonolithic(metadata, distOutputImage)
-            let writer = new XisfWriter()
-            do! writer.WriteAsync(outUnit, distPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-
-        // Build console output with RBF info
-        let rbfInfo =
-            match rbfResult with
-            | Some result when result.Coefficients.IsSome ->
-                let distName =
-                    match distConfig with
-                    | Some cfg ->
-                        match cfg.Kernel with
-                        | RBFTransform.Wendland _ -> "wend"
-                        | RBFTransform.ThinPlateSpline -> "tps"
-                        | RBFTransform.InverseMultiquadric -> "imq"
-                    | None -> ""
-                sprintf " [%s rms=%.2f]" distName result.ResidualRMS
-            | _ -> ""
-
-        printfn $"  dx={matched.Transform.Dx:F1} dy={matched.Transform.Dy:F1} rot={matched.Transform.Rotation:F2}° -> {Path.GetFileName outputPath}{rbfInfo}"
-    }
-
-/// Process single file in match mode
-let processMatchMode
-    (inputPath: string)
-    (outputPath: string)
-    (masters: (MasterFrames * Algorithms.Calibration.CalibrationConfig) option)
-    (binConfig: BinningConfig)
-    (detConfig: DetectionConfig)
-    (matchConfig: MatchingConfig)
-    (intensity: float)
-    (outputFormat: XisfSampleFormat option)
-    : Async<Result<unit, PipelineError>> =
-
-    asyncResult {
-        let fileName = Path.GetFileName inputPath
-
-        let! img = loadImage inputPath |> AsyncResult.mapError LoadFailed
-        let! preprocessed = preprocessImage masters binConfig img |> AsyncResult.ofResult
-
-        let detected = Alignment.detect detConfig preprocessed
-
-        let! matched = Alignment.matchToReference matchConfig fileName detected |> AsyncResult.ofResult |> AsyncResult.mapError MatchingFailed
-
-        // Read original XISF for metadata
-        let reader = new XisfReader()
-        let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-        let originalImg = unit.Images.[0]
-
-        // Generate match visualization
-        let format = outputFormat |> Option.defaultValue originalImg.SampleFormat
-        let pixels = generateMatchOutput matched matchConfig.RefStars intensity format
-
-        // Create headers
-        let matchedCount = matched.MatchedPairs.Length
-        let unmatchedCount = detected.Stars.Length - matchedCount
-
-        // Build headers with diagnostics if available
-        let baseHeaders = [|
-            XisfFitsKeyword("IMAGETYP", "MATCHMAP", "Type of image") :> XisfCoreElement
-            XisfFitsKeyword("SWCREATE", "XisfPrep Align", "Software that created this file") :> XisfCoreElement
-            XisfFitsKeyword("TGTstars", detected.Stars.Length.ToString(), "Stars detected in target") :> XisfCoreElement
-            XisfFitsKeyword("REFSTARS", matchConfig.RefStars.Length.ToString(), "Stars in reference") :> XisfCoreElement
-            XisfFitsKeyword("MATCHED", matchedCount.ToString(), "Matched star pairs") :> XisfCoreElement
-            XisfFitsKeyword("UNMATCHD", unmatchedCount.ToString(), "Unmatched target stars") :> XisfCoreElement
-        |]
-
-        let diagHeaders =
-            match matched.Diagnostics with
-            | Some diag ->
-                [|
-                    XisfFitsKeyword("TRIFORME", diag.TrianglesFormed.ToString(), "Triangles formed") :> XisfCoreElement
-                    XisfFitsKeyword("TRIMATCD", diag.TrianglesMatched.ToString(), "Triangles matched") :> XisfCoreElement
-                    XisfFitsKeyword("MATCHPCT", sprintf "%.1f" diag.MatchPercentage, "Triangle match percentage") :> XisfCoreElement
-                    XisfFitsKeyword("TOPVOTES", diag.TopVoteCount.ToString(), "Top correspondence votes") :> XisfCoreElement
-                |]
-            | None -> [||]
-
-        let transformHeaders = [|
-            XisfFitsKeyword("XSHIFT", sprintf "%.2f" matched.Transform.Dx, "Estimated X shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("YSHIFT", sprintf "%.2f" matched.Transform.Dy, "Estimated Y shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("ROTATION", sprintf "%.4f" matched.Transform.Rotation, "Estimated rotation (degrees)") :> XisfCoreElement
-            XisfFitsKeyword("SCALE", sprintf "%.6f" matched.Transform.Scale, "Estimated scale factor") :> XisfCoreElement
-            XisfFitsKeyword("HISTORY", "", "Match visualization by XisfPrep Align (match mode)") :> XisfCoreElement
-        |]
-
-        let headers = Array.concat [baseHeaders; diagHeaders; transformHeaders]
-
-        let outputImage =
-            createOutputImage originalImg pixels detected.Image.Width detected.Image.Height
-                detected.Image.Channels format headers
-
-        do! writeOutputFile outputPath outputImage |> AsyncResult.mapError SaveFailed
-
-        let transformStr = sprintf "dx=%.1f dy=%.1f rot=%.2f°" matched.Transform.Dx matched.Transform.Dy matched.Transform.Rotation
-        let algoStr = match matchConfig.Params.Algorithm with Triangle -> "" | Expanding -> " [exp]"
-        printfn $"  {matchedCount}/{detected.Stars.Length} matched -> {Path.GetFileName outputPath} ({transformStr}){algoStr}"
     }
 
 /// Process single file in distortion visualization mode
@@ -1296,122 +1009,6 @@ let generateOutput
                 Ok distImage
         | _ -> Error (MatchingFailed (TransformationFailed "Distortion requires results"))
 
-let processDistortionMode
-    (inputPath: string)
-    (outputPath: string)
-    (masters: (MasterFrames * Algorithms.Calibration.CalibrationConfig) option)
-    (binConfig: BinningConfig)
-    (detConfig: DetectionConfig)
-    (matchConfig: MatchingConfig)
-    (distConfig: DistortionConfig)
-    (refWidth: int)
-    (refHeight: int)
-    (showStats: bool)
-    : Async<Result<unit, PipelineError>> =
-
-    asyncResult {
-        let fileName = Path.GetFileName inputPath
-
-        let! img = loadImage inputPath |> AsyncResult.mapError LoadFailed
-        let! preprocessed = preprocessImage masters binConfig img |> AsyncResult.ofResult
-
-        let detected = Alignment.detect detConfig preprocessed
-
-        // Verify dimensions match reference
-        if detected.Image.Width <> refWidth || detected.Image.Height <> refHeight then
-            return! Error (DetectionFailed $"Image dimensions don't match reference")
-
-        let! matched = Alignment.matchToReference matchConfig fileName detected |> AsyncResult.ofResult |> AsyncResult.mapError MatchingFailed
-
-        // Compute RBF distortion (required in this mode)
-        let (_, rbfResult) = Alignment.computeDistortion (Some distConfig) matched
-
-        let resultWithCoeffs =
-            match rbfResult with
-            | None -> Error (DetectionFailed "Failed to compute RBF distortion")
-            | Some r ->
-                match r.Coefficients with
-                | None -> Error (DetectionFailed "Failed to compute RBF coefficients")
-                | Some coeffs -> Ok (r, coeffs)
-
-        let! (result, coeffs) = resultWithCoeffs |> AsyncResult.ofResult
-
-        // Read original XISF for metadata
-        let reader = new XisfReader()
-        let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-        let originalImg = unit.Images.[0]
-
-        // Print console heatmap if requested
-        if showStats then
-            printDistortionHeatmap detected.Image.Width detected.Image.Height matched.Transform (Some coeffs) 10
-
-        // Generate RGB distortion heatmap
-        let width = detected.Image.Width
-        let height = detected.Image.Height
-        let pixelCount = width * height
-        let pixels = Array.zeroCreate<byte> (pixelCount * 3 * 2) // RGB * UInt16
-        let maxMag = 10.0
-
-        Array.Parallel.iter (fun pixIdx ->
-            let ox = pixIdx % width
-            let oy = pixIdx / width
-            let (tx, ty) = RBFTransform.applyFullInverseTransform matched.Transform (Some coeffs) (float ox) (float oy) 5 0.01
-            let dx = float ox - tx
-            let dy = float oy - ty
-            let mag = sqrt (dx * dx + dy * dy)
-            let (r, g, b) = magnitudeToColor mag maxMag
-
-            let byteIdx = pixIdx * 6
-            pixels.[byteIdx] <- byte (r &&& 0xFFus)
-            pixels.[byteIdx + 1] <- byte (r >>> 8)
-            pixels.[byteIdx + 2] <- byte (g &&& 0xFFus)
-            pixels.[byteIdx + 3] <- byte (g >>> 8)
-            pixels.[byteIdx + 4] <- byte (b &&& 0xFFus)
-            pixels.[byteIdx + 5] <- byte (b >>> 8)
-        ) [| 0 .. pixelCount - 1 |]
-
-        // Overlay control points as white circles
-        for (cx, cy) in coeffs.ControlPoints do
-            for ch in 0 .. 2 do
-                Painting.paintCircle pixels width height 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
-
-        // Create headers with RBF statistics
-        let distName = match distConfig.Kernel with
-                       | RBFTransform.Wendland _ -> "WENDLAND"
-                       | RBFTransform.ThinPlateSpline -> "TPS"
-                       | RBFTransform.InverseMultiquadric -> "IMQ"
-
-        let headers = [|
-            XisfFitsKeyword("IMAGETYP", "DISTMAP", "Distortion visualization") :> XisfCoreElement
-            XisfFitsKeyword("DISTCORR", distName, "Correction method") :> XisfCoreElement
-            XisfFitsKeyword("RBFPTS", result.ControlPointCount.ToString(), "Control points") :> XisfCoreElement
-            XisfFitsKeyword("RBFRMS", sprintf "%.3f" result.ResidualRMS, "RBF residual RMS (px)") :> XisfCoreElement
-            XisfFitsKeyword("RBFMAX", sprintf "%.3f" result.MaxResidual, "RBF max residual (px)") :> XisfCoreElement
-            XisfFitsKeyword("XSHIFT", sprintf "%.2f" matched.Transform.Dx, "X shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("YSHIFT", sprintf "%.2f" matched.Transform.Dy, "Y shift (pixels)") :> XisfCoreElement
-            XisfFitsKeyword("ROTATION", sprintf "%.4f" matched.Transform.Rotation, "Rotation (degrees)") :> XisfCoreElement
-            XisfFitsKeyword("HISTORY", "", "Distortion map by XisfPrep Align") :> XisfCoreElement
-        |]
-
-        // Create RGB output
-        let geometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
-        let dataBlock = InlineDataBlock(ReadOnlyMemory(pixels), XisfEncoding.Base64)
-        let bounds = PixelIO.getBoundsForFormat XisfSampleFormat.UInt16 |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
-
-        let distImage = XisfImage(
-            geometry, XisfSampleFormat.UInt16, XisfColorSpace.RGB, dataBlock, bounds,
-            originalImg.PixelStorage, originalImg.ImageType, originalImg.Offset,
-            originalImg.Orientation, originalImg.ImageId, originalImg.Uuid,
-            originalImg.Properties, headers
-        )
-
-        let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align2 v1.0")
-        let outUnit = XisfFactory.CreateMonolithic(metadata, distImage)
-        let writer = new XisfWriter()
-        do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-
-        printfn $"  {result.ControlPointCount} pts, rms={result.ResidualRMS:F2}px -> {Path.GetFileName outputPath}"
-    }
 
 let processFile
     (inputPath: string)
@@ -1446,7 +1043,7 @@ let processFile
 
 let processBatch
     (files: string[])
-    (opts: AlignOptions)
+    (opts: PreProcessOptions)
     (configs: PipelineConfigs)
     : Async<int> =
     async {
@@ -1476,24 +1073,29 @@ let processBatch
     }
 
 let showHelp() =
-    printfn "align - Register images to reference frame"
+    printfn "preprocess - Unified preprocessing pipeline with calibration, binning, and registration"
     printfn ""
-    printfn "Usage: xisfprep align [options]"
+    printfn "Usage: xisfprep preprocess [options]"
+    printfn ""
+    printfn "Description:"
+    printfn "  Railway-oriented preprocessing pipeline supporting multiple output modes."
+    printfn "  Pipeline: Load → Calibrate → Bin → Detect → Match → Distort → Transform → Save"
+    printfn "  Each step is optional and configurable based on output mode."
     printfn ""
     printfn "Required:"
     printfn "  --input, -i <pattern>     Input image files (wildcards supported)"
-    printfn "  --output, -o <directory>  Output directory for aligned files"
+    printfn "  --output, -o <directory>  Output directory for processed files"
     printfn ""
     printfn "Reference Selection:"
-    printfn "  --reference, -r <file>    Reference frame to align to (first file if omitted)"
+    printfn "  --reference, -r <file>    Reference frame for registration (first file if omitted)"
     printfn "  --auto-reference          Auto-select best reference (highest star count/SNR)"
     printfn ""
     printfn "Output Mode:"
-    printfn "  --output-mode <mode>      Output type (default: align)"
-    printfn "                              detect     - Show detected stars only"
-    printfn "                              match      - Show matched star correspondences"
-    printfn "                              align      - Apply transformation (default)"
-    printfn "                              distortion - Visualize distortion field"
+    printfn "  --output-mode <mode>      Processing pipeline mode (default: align)"
+    printfn "                              detect     - Star detection only (calibrate → bin → detect)"
+    printfn "                              match      - Star matching visualization (+ match)"
+    printfn "                              align      - Full registration (+ distort → transform)"
+    printfn "                              distortion - Distortion field visualization"
     printfn ""
     printfn "Alignment Parameters:"
     printfn "  --interpolation <method>  Resampling method (default: lanczos3)"
@@ -1567,12 +1169,12 @@ let showHelp() =
     printfn "                              sum     - Sum binning (adds pixel values)"
     printfn ""
     printfn "Examples:"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\""
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode detect"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"validation/\" --output-mode match --intensity 0.8"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"aligned/\" --bin-factor 2  # Quick 2x2 binned alignment"
-    printfn "  xisfprep align -i \"images/*.xisf\" -o \"preview/\" --bin-factor 4 --bin-method median  # Fast preview"
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"aligned/\" --auto-reference"
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"aligned/\" -r \"best.xisf\""
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"validation/\" --output-mode detect"
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"validation/\" --output-mode match --intensity 0.8"
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"aligned/\" --bin-factor 2  # Quick 2x2 binned alignment"
+    printfn "  xisfprep preprocess -i \"images/*.xisf\" -o \"preview/\" --bin-factor 4 --bin-method median  # Fast preview"
 
 let run (args: string array) =
     if args |> Array.exists (fun a -> a = "--help" || a = "-h") then
@@ -1582,7 +1184,7 @@ let run (args: string array) =
         let setupResult = asyncResult {
             let opts = parseArgs args
 
-            do! validateAlignOptions opts |> Result.mapError ValidationFailed
+            do! validatePreProcessOptions opts |> Result.mapError ValidationFailed
             do! validateCalibrationConfig opts |> Result.mapError CalibrationValidationFailed
 
             let! files = InputValidation.resolveInputFiles opts.Input
@@ -1632,7 +1234,7 @@ let run (args: string array) =
             | Error err ->
                 Log.Error(err.ToString())
                 printfn ""
-                printfn "Run 'xisfprep align --help' for usage information"
+                printfn "Run 'xisfprep preprocess --help' for usage information"
                 return 1
             | Ok (opts, files, configs) ->
                 let! exitCode = processBatch files opts configs
