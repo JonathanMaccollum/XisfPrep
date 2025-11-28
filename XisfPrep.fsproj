@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Compile Include="PixelIO.fs" />
+    <Compile Include="XisfIO.fs" />
     <Compile Include="Algorithms\Statistics.fs" />
     <Compile Include="Algorithms\InputValidation.fs" />
     <Compile Include="Algorithms\Binning.fs" />
@@ -20,6 +21,7 @@
     <Compile Include="Algorithms\Interpolation.fs" />
     <Compile Include="Algorithms\RBFTransform.fs" />
     <Compile Include="Algorithms\Alignment.fs" />
+    <Compile Include="Commands\SharedInfra.fs" />
     <Compile Include="Commands\Calibrate.fs" />
     <Compile Include="Commands\Debayer.fs" />
     <Compile Include="Commands\Headers.fs" />

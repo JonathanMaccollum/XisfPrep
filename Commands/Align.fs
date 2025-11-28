@@ -550,24 +550,15 @@ let buildPipelineConfigs
 
 let loadImage (filePath: string) : Async<Result<ImageData, string>> =
     async {
-        try
-            let reader = new XisfReader()
-            let! unit = reader.ReadAsync(filePath) |> Async.AwaitTask
-            let img = unit.Images.[0]
-
-            let width = int img.Geometry.Width
-            let height = int img.Geometry.Height
-            let channels = int img.Geometry.ChannelCount
-            let pixels = PixelIO.readPixelsAsFloat img
-
+        match! XisfIO.loadImageWithPixels filePath with
+        | Error err -> return Error (err.ToString())
+        | Ok (_, metadata, pixels) ->
             return Ok {
                 Pixels = pixels
-                Width = width
-                Height = height
-                Channels = channels
+                Width = metadata.Width
+                Height = metadata.Height
+                Channels = metadata.Channels
             }
-        with ex ->
-            return Error ex.Message
     }
 
 let createBlackPixels (width: int) (height: int) (channels: int) (format: XisfSampleFormat) : byte[] =
@@ -637,7 +628,7 @@ let generateAlignOutput (transformed: ImageData) : byte[] =
     // Output as Float32 for interpolation precision
     PixelIO.writePixelsFromFloat transformed.Pixels XisfSampleFormat.Float32 true
 
-/// Create XISF output image
+/// Create XISF output image using XisfIO
 let createOutputImage
     (originalImg: XisfImage)
     (pixels: byte[])
@@ -646,44 +637,27 @@ let createOutputImage
     (channels: int)
     (format: XisfSampleFormat)
     (headers: XisfCoreElement[])
-    : XisfImage =
-
-    let geometry = XisfImageGeometry([| uint32 width; uint32 height |], uint32 channels)
-    let dataBlock = InlineDataBlock(ReadOnlyMemory(pixels), XisfEncoding.Base64)
-    let bounds = PixelIO.getBoundsForFormat format |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
+    : Result<XisfImage, PipelineError> =
 
     let inPlaceKeys = Set.ofList ["IMAGETYP"; "SWCREATE"]
-    let existingFits =
-        if isNull originalImg.AssociatedElements then [||]
-        else originalImg.AssociatedElements |> Seq.toArray
 
-    let preservedFits =
-        existingFits
-        |> Array.filter (fun elem ->
-            match elem with
-            | :? XisfFitsKeyword as kw -> not (inPlaceKeys.Contains kw.Name)
-            | _ -> true)
+    let outputConfig = {
+        XisfIO.defaultOutputImageConfig with
+            Dimensions = Some (width, height, channels)
+            Format = Some format
+            ExcludeFitsKeys = inPlaceKeys
+            AdditionalFits = headers
+    }
 
-    let allFits = Array.append preservedFits headers
+    XisfIO.createOutputImage originalImg pixels outputConfig
+    |> Result.mapError (fun err -> SaveFailed (err.ToString()))
 
-    XisfImage(
-        geometry, format, originalImg.ColorSpace, dataBlock, bounds,
-        originalImg.PixelStorage, originalImg.ImageType, originalImg.Offset,
-        originalImg.Orientation, originalImg.ImageId, originalImg.Uuid,
-        originalImg.Properties, allFits
-    )
-
-/// Write XISF file
+/// Write XISF file using XisfIO
 let writeOutputFile (path: string) (image: XisfImage) : Async<Result<unit, string>> =
     async {
-        try
-            let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Align v1.0")
-            let unit = XisfFactory.CreateMonolithic(metadata, image)
-            let writer = new XisfWriter()
-            do! writer.WriteAsync(unit, path) |> Async.AwaitTask
-            return Ok ()
-        with ex ->
-            return Error ex.Message
+        match! XisfIO.writeImage path "XisfPrep Align v1.0" image with
+        | Ok () -> return Ok ()
+        | Error err -> return Error (err.ToString())
     }
 
 /// Process reference image through pipeline
@@ -750,7 +724,7 @@ let generateOutput
             XisfFitsKeyword("STARGRID", detConfig.GridSize.ToString(), "Background grid size") :> XisfCoreElement
             XisfFitsKeyword("HISTORY", "", "Star detection by XisfPrep Align (detect mode)") :> XisfCoreElement
         |]
-        Ok (createOutputImage originalImg pixels detected.Image.Width detected.Image.Height detected.Image.Channels format headers)
+        createOutputImage originalImg pixels detected.Image.Width detected.Image.Height detected.Image.Channels format headers
 
     | Match ->
         match matched with
@@ -775,7 +749,7 @@ let generateOutput
                 XisfFitsKeyword("HISTORY", "", "Match by XisfPrep") :> XisfCoreElement
             |]
             let headers = Array.append baseHeaders transformHeaders
-            Ok (createOutputImage originalImg pixels detected.Image.Width detected.Image.Height detected.Image.Channels format headers)
+            createOutputImage originalImg pixels detected.Image.Width detected.Image.Height detected.Image.Channels format headers
 
     | Align ->
         match (matched, transformed) with
@@ -790,7 +764,7 @@ let generateOutput
                 XisfFitsKeyword("STARMTCH", m.MatchedPairs.Length.ToString(), "Matched pairs") :> XisfCoreElement
                 XisfFitsKeyword("HISTORY", "", "Aligned by XisfPrep") :> XisfCoreElement
             |]
-            Ok (createOutputImage originalImg pixels t.Width t.Height t.Channels XisfSampleFormat.Float32 headers)
+            createOutputImage originalImg pixels t.Width t.Height t.Channels XisfSampleFormat.Float32 headers
         | _ -> Error (TransformFailed (TransformationFailed "Align requires transformation"))
 
     | Distortion ->
@@ -822,16 +796,15 @@ let generateOutput
                 for (cx, cy) in coeffs.ControlPoints do
                     for ch in 0 .. 2 do
                         Painting.paintCircle pixels width height 3 ch cx cy 3.0 1.0 XisfSampleFormat.UInt16
-                let geometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
-                let dataBlock = InlineDataBlock(ReadOnlyMemory(pixels), XisfEncoding.Base64)
-                let bounds = PixelIO.getBoundsForFormat XisfSampleFormat.UInt16 |> Option.defaultValue (Unchecked.defaultof<XisfImageBounds>)
-                let distImage = XisfImage(
-                    geometry, XisfSampleFormat.UInt16, XisfColorSpace.RGB, dataBlock, bounds,
-                    originalImg.PixelStorage, originalImg.ImageType, originalImg.Offset,
-                    originalImg.Orientation, originalImg.ImageId, originalImg.Uuid,
-                    originalImg.Properties, [||]
-                )
-                Ok distImage
+
+                let outputConfig = {
+                    XisfIO.defaultOutputImageConfig with
+                        Dimensions = Some (width, height, 3)
+                        Format = Some XisfSampleFormat.UInt16
+                }
+
+                XisfIO.createOutputImage originalImg pixels outputConfig
+                |> Result.mapError (fun err -> MatchingFailed (TransformationFailed (err.ToString())))
         | _ -> Error (MatchingFailed (TransformationFailed "Distortion requires results"))
 
 let processFile
@@ -842,14 +815,15 @@ let processFile
     asyncResult {
         let fileName = Path.GetFileName inputPath
 
-        let reader = new XisfReader()
-        let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask |> AsyncResult.ofAsync
-        let originalImg = unit.Images.[0]
+        let! (originalImg, metadata, pixels) =
+            XisfIO.loadImageWithPixels inputPath
+            |> AsyncResult.mapError (fun err -> LoadFailed (err.ToString()))
+
         let rawImage = {
-            Pixels = PixelIO.readPixelsAsFloat originalImg
-            Width = int originalImg.Geometry.Width
-            Height = int originalImg.Geometry.Height
-            Channels = int originalImg.Geometry.ChannelCount
+            Pixels = pixels
+            Width = metadata.Width
+            Height = metadata.Height
+            Channels = metadata.Channels
         }
 
         let detected = Alignment.detect configs.Detection rawImage

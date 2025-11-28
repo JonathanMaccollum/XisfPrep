@@ -730,13 +730,26 @@ let run (args: string array) =
                 printfn "Loading images into memory..."
 
                 // Load all images
-                let reader = new XisfReader()
-                let! units =
+                let! loadResults =
                     files
-                    |> Array.map (fun f -> reader.ReadAsync(f) |> Async.AwaitTask)
+                    |> Array.map XisfIO.loadImage
                     |> Async.Parallel
 
-                let images = units |> Array.map (fun u -> u.Images.[0])
+                let images =
+                    loadResults
+                    |> Array.choose (function
+                        | Ok img -> Some img
+                        | Error err ->
+                            Log.Error($"Failed to load image: {err}")
+                            None)
+
+                if images.Length < files.Length then
+                    Log.Error($"Failed to load {files.Length - images.Length} images")
+                    return 1
+                elif images.Length = 0 then
+                    Log.Error("No images loaded successfully")
+                    return 1
+                else
 
                 printfn $"Loaded {images.Length} images"
 
@@ -909,42 +922,37 @@ let run (args: string array) =
                 let outputFits =
                     Array.concat [identicalFits; calibrationHistory; integrationHistory]
 
-                // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
-                let bounds =
-                    match PixelIO.getBoundsForFormat outputFormat with
-                    | Some b -> b
-                    | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+                // Create output image using XisfIO
+                let outputConfig = {
+                    XisfIO.defaultOutputImageConfig with
+                        Format = Some outputFormat
+                        HistoryEntries = integrationHistory |> Array.map (fun elem ->
+                            match elem with
+                            | :? XisfFitsKeyword as kw -> kw.Comment
+                            | _ -> "") |> Array.toList
+                        AdditionalFits = Array.concat [identicalFits; calibrationHistory; integrationHistory]
+                        AdditionalProps = Array.concat [integrationProps; inputFileProps; varyingProps]
+                }
 
-                let dataBlock = InlineDataBlock(ReadOnlyMemory(stacked), XisfEncoding.Base64)
-                let outImage = XisfImage(
-                    firstImg.Geometry,
-                    outputFormat,
-                    firstImg.ColorSpace,
-                    dataBlock,
-                    bounds,
-                    firstImg.PixelStorage,
-                    firstImg.ImageType,
-                    firstImg.Offset,
-                    firstImg.Orientation,
-                    firstImg.ImageId,
-                    firstImg.Uuid,
-                    outputProps,
-                    outputFits
-                )
-
-                let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Integrate v1.0")
-                let outUnit = XisfFactory.CreateMonolithic(metadata, outImage)
+                match XisfIO.createOutputImage firstImg stacked outputConfig with
+                | Error err ->
+                    Log.Error($"Failed to create output image: {err}")
+                    return 1
+                | Ok outImage ->
 
                 printfn "Writing output..."
-                let writer = new XisfWriter()
-                do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask
+                match! XisfIO.writeImage outputPath "XisfPrep Integrate v1.0" outImage with
+                | Error err ->
+                    Log.Error($"Failed to write output: {err}")
+                    return 1
+                | Ok () ->
 
-                let sizeMB = (FileInfo outputPath).Length / 1024L / 1024L
-                printfn ""
-                printfn $"Integration complete: {Path.GetFileName outputPath} ({sizeMB} MB)"
-                printfn $"  Integrated {images.Length} images ({width}x{height}, {channels} channel(s))"
+                    let sizeMB = (FileInfo outputPath).Length / 1024L / 1024L
+                    printfn ""
+                    printfn $"Integration complete: {Path.GetFileName outputPath} ({sizeMB} MB)"
+                    printfn $"  Integrated {images.Length} images ({width}x{height}, {channels} channel(s))"
 
-                return 0
+                    return 0
             with ex ->
                 Log.Error($"Error: {ex.Message}")
                 printfn ""

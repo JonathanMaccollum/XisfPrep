@@ -283,13 +283,15 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
 
             printfn $"Processing: {fileName}"
 
-            let reader = new XisfReader()
-            let! unit = reader.ReadAsync(inputPath) |> Async.AwaitTask
-            let img = unit.Images.[0]
+            match! XisfIO.loadImageWithPixels inputPath with
+            | Error err ->
+                Log.Error($"Failed to load {fileName}: {err}")
+                return false
+            | Ok (img, metadata, pixelFloats) ->
 
             // Validate that image is monochrome (single channel) before debayering
-            if img.Geometry.ChannelCount <> 1u then
-                Log.Error($"Cannot debayer '{fileName}': image has {img.Geometry.ChannelCount} channels (expected 1 for monochrome Bayer data)")
+            if metadata.Channels <> 1 then
+                Log.Error($"Cannot debayer '{fileName}': image has {metadata.Channels} channels (expected 1 for monochrome Bayer data)")
                 return false
             elif img.ColorSpace = XisfColorSpace.RGB then
                 // Additional safety check: reject if already RGB color space
@@ -299,11 +301,8 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
 
             let bayerPattern = getBayerPattern img patternOverride
 
-            // Read pixels using PixelIO (handles all sample formats)
-            let pixelFloats = PixelIO.readPixelsAsFloat img
-
-            let width = int img.Geometry.Width
-            let height = int img.Geometry.Height
+            let width = metadata.Width
+            let height = metadata.Height
 
             let getPixel x y =
                 // Clamp coordinates to image bounds (replicate edge pixels)
@@ -345,85 +344,60 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
                 | None -> PixelIO.getRecommendedOutputFormat img.SampleFormat
 
-            // Filter out ColorFilterArray and Bayer-related FITS keywords - debayered images are no longer mosaiced
-            let bayerKeywords = Set.ofList ["BAYERPAT"; "XBAYROFF"; "YBAYROFF"]
-
             let historyEntry = $"Debayered using VNG algorithm (pattern: {bayerPattern})"
 
-            let filterElements (additionalKeywords: XisfFitsKeyword array) =
-                if isNull img.AssociatedElements then
-                    additionalKeywords |> Array.map (fun k -> k :> XisfCoreElement)
-                else
-                    let filtered =
-                        img.AssociatedElements
-                        |> Seq.toArray
-                        |> Array.filter (fun e ->
-                            match e with
-                            | :? XisfColorFilterArray -> false
-                            | :? XisfFitsKeyword as fits -> not (bayerKeywords.Contains fits.Name)
-                            | _ -> true)
-                    Array.append filtered (additionalKeywords |> Array.map (fun k -> k :> XisfCoreElement))
-
-            // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
-            let bounds =
-                match PixelIO.getBoundsForFormat outputFormat with
-                | Some b -> b
-                | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
+            // Exclude ColorFilterArray and Bayer-related FITS keywords
+            let bayerKeywords = Set.ofList ["BAYERPAT"; "XBAYROFF"; "YBAYROFF"]
 
             if split then
                 // Split into three separate monochrome files
                 let channelNames = [| ("R", "Red"); ("G", "Green"); ("B", "Blue") |]
                 let pixelCount = width * height
 
-                for i in 0 .. 2 do
-                    let (chSuffix, filterName) = channelNames.[i]
-                    let outFileName = $"{baseName}{suffix}_{chSuffix}.xisf"
-                    let outPath = Path.Combine(outputDir, outFileName)
+                let! writeResults =
+                    channelNames
+                    |> Array.mapi (fun i (chSuffix, filterName) ->
+                        async {
+                            let outFileName = $"{baseName}{suffix}_{chSuffix}.xisf"
+                            let outPath = Path.Combine(outputDir, outFileName)
 
-                    // Extract single channel from interleaved RGB data
-                    let channelFloats = Array.zeroCreate pixelCount
-                    for p in 0 .. pixelCount - 1 do
-                        channelFloats.[p] <- debayeredFloats.[p * 3 + i]
+                            // Extract single channel from interleaved RGB data
+                            let channelFloats = Array.zeroCreate pixelCount
+                            for p in 0 .. pixelCount - 1 do
+                                channelFloats.[p] <- debayeredFloats.[p * 3 + i]
 
-                    let channelBytes = PixelIO.writePixelsFromFloat channelFloats outputFormat normalize
+                            let channelBytes = PixelIO.writePixelsFromFloat channelFloats outputFormat normalize
 
-                    let monoGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 1u)
-                    let dataBlock = InlineDataBlock(ReadOnlyMemory(channelBytes), XisfEncoding.Base64)
+                            // Create output config with FILTER keyword and excluding Bayer keywords
+                            let outputConfig = {
+                                XisfIO.defaultOutputImageConfig with
+                                    Dimensions = Some (width, height, 1)
+                                    Format = Some outputFormat
+                                    HistoryEntries = [historyEntry]
+                                    ExcludeFitsKeys = bayerKeywords
+                                    AdditionalFits = [|
+                                        XisfFitsKeyword("FILTER", "", filterName) :> XisfCoreElement
+                                    |]
+                            }
 
-                    // Add FILTER keyword and HISTORY
-                    let additionalKeywords = [|
-                        XisfFitsKeyword("FILTER", "", filterName)
-                        XisfFitsKeyword("HISTORY", "", historyEntry)
-                    |]
-                    let elements = filterElements additionalKeywords
-                    let elementsList =
-                        if elements.Length = 0 then null
-                        else elements :> System.Collections.Generic.IReadOnlyList<_>
+                            match XisfIO.createOutputImage img channelBytes outputConfig with
+                            | Error err ->
+                                Log.Error($"Failed to create output image for {chSuffix}: {err}")
+                                return false
+                            | Ok monoImage ->
 
-                    let monoImage = XisfImage(
-                        monoGeometry,
-                        outputFormat,
-                        XisfColorSpace.Gray,
-                        dataBlock,
-                        bounds,
-                        XisfPixelStorage.Normal,
-                        img.ImageType,
-                        img.Offset,
-                        img.Orientation,
-                        img.ImageId,
-                        img.Uuid,
-                        img.Properties,
-                        elementsList
-                    )
+                            match! XisfIO.writeImage outPath "XisfPrep Debayer v1.0" monoImage with
+                            | Error err ->
+                                Log.Error($"Failed to write {outFileName}: {err}")
+                                return false
+                            | Ok () ->
+                                let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
+                                printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} Mono)"
+                                return true
+                        })
+                    |> Async.Sequential
 
-                    let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Debayer v1.0")
-                    let outUnit = XisfFactory.CreateMonolithic(metadata, monoImage)
-
-                    let writer = new XisfWriter()
-                    do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
-
-                    let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
-                    printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} Mono)"
+                return writeResults |> Array.forall id
 
             else
                 // Standard RGB output
@@ -432,41 +406,31 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
 
                 let debayered = PixelIO.writePixelsFromFloat debayeredFloats outputFormat normalize
 
-                let rgbGeometry = XisfImageGeometry([| uint32 width; uint32 height |], 3u)
-                let dataBlock = InlineDataBlock(ReadOnlyMemory(debayered), XisfEncoding.Base64)
+                // Create output config excluding Bayer keywords
+                let outputConfig = {
+                    XisfIO.defaultOutputImageConfig with
+                        Dimensions = Some (width, height, 3)
+                        Format = Some outputFormat
+                        HistoryEntries = [historyEntry]
+                        ExcludeFitsKeys = bayerKeywords
+                }
 
-                let additionalKeywords = [| XisfFitsKeyword("HISTORY", "", historyEntry) |]
-                let elements = filterElements additionalKeywords
-                let filteredElements =
-                    if elements.Length = 0 then null
-                    else elements :> System.Collections.Generic.IReadOnlyList<_>
+                match XisfIO.createOutputImage img debayered outputConfig with
+                | Error err ->
+                    Log.Error($"Failed to create output image: {err}")
+                    return false
+                | Ok rgbImage ->
 
-                let rgbImage = XisfImage(
-                    rgbGeometry,
-                    outputFormat,
-                    XisfColorSpace.RGB,
-                    dataBlock,
-                    bounds,
-                    XisfPixelStorage.Normal,
-                    img.ImageType,
-                    img.Offset,
-                    img.Orientation,
-                    img.ImageId,
-                    img.Uuid,
-                    img.Properties,
-                    filteredElements
-                )
+                match! XisfIO.writeImage outPath "XisfPrep Debayer v1.0" rgbImage with
+                | Error err ->
+                    Log.Error($"Failed to write {outFileName}: {err}")
+                    return false
+                | Ok () ->
 
-                let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Debayer v1.0")
-                let outUnit = XisfFactory.CreateMonolithic(metadata, rgbImage)
+                    let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
+                    printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} RGB)"
 
-                let writer = new XisfWriter()
-                do! writer.WriteAsync(outUnit, outPath) |> Async.AwaitTask
-
-                let sizeMB = (FileInfo outPath).Length / 1024L / 1024L
-                printfn $"  -> {outFileName} ({sizeMB} MB, {width}x{height} RGB)"
-
-            return true
+                    return true
         with ex ->
             Log.Error($"Error processing {Path.GetFileName(inputPath)}: {ex.Message}")
             return false

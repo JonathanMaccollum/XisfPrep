@@ -198,71 +198,19 @@ let logClippingWarnings (zeroCount: int) (flatZeroCount: int) (pixelCount: int) 
         if pct > 1.0 then
             Log.Warning("Output has {Count} zero pixels ({Pct:F2}%) - consider increasing --pedestal", zeroCount, pct)
 
-let createCalibratedImage (lightImg: XisfImage) (calibratedData: byte[]) (calConfig: CalibrationConfig) (outputFormat: XisfSampleFormat) (darkScale: float) =
-    let dataBlock = InlineDataBlock(ReadOnlyMemory(calibratedData), XisfEncoding.Base64)
 
-    let historyEntries =
-        let baseHistory = buildCalibrationHistory calConfig
-        if calConfig.OptimizeDark then
-            baseHistory @ [sprintf "Dark scale factor: %.6f" darkScale]
-        else
-            baseHistory
-    let historyFits = historyEntries |> List.map (fun text -> XisfFitsKeyword("HISTORY", "", text) :> XisfCoreElement)
-
-    let existingElements =
-        if isNull lightImg.AssociatedElements then [||]
-        else lightImg.AssociatedElements |> Seq.toArray
-
-    let allElements = Array.append existingElements (Array.ofList historyFits)
-
-    let calibrationProps = buildCalibrationProperties calConfig darkScale
-    let existingProps =
-        if isNull lightImg.Properties then [||]
-        else lightImg.Properties |> Seq.toArray
-
-    let allProps = Array.append existingProps (Array.ofList calibrationProps)
-
-    // Get bounds per XISF spec: Some for Float32/Float64, None for integer formats
-    let bounds =
-        match PixelIO.getBoundsForFormat outputFormat with
-        | Some b -> b
-        | None -> Unchecked.defaultof<XisfImageBounds>  // null for integer formats
-
-    XisfImage(
-        lightImg.Geometry,
-        outputFormat,
-        lightImg.ColorSpace,
-        dataBlock,
-        bounds,
-        lightImg.PixelStorage,
-        lightImg.ImageType,
-        lightImg.Offset,
-        lightImg.Orientation,
-        lightImg.ImageId,
-        lightImg.Uuid,
-        allProps,
-        allElements
-    )
-
-let calibrateImage (lightPath: string) (masters: MasterFrames) (calConfig: CalibrationConfig) (outputFormat: XisfSampleFormat option) : Async<XisfImage * float> =
-    async {
-        let reader = new XisfReader()
-        let! lightUnit = reader.ReadAsync(lightPath) |> Async.AwaitTask
-
-        if lightUnit.Images.Count = 0 then
-            failwithf "No images in light frame: %s" lightPath
-
-        let lightImg = lightUnit.Images.[0]
-        let width = int lightImg.Geometry.Width
-        let height = int lightImg.Geometry.Height
-        let channels = int lightImg.Geometry.ChannelCount
+let calibrateImage (lightPath: string) (masters: MasterFrames) (calConfig: CalibrationConfig) (outputFormat: XisfSampleFormat option) : Async<Result<XisfImage * float, CalibrateError>> =
+    asyncResult {
+        // Load image
+        let! (lightImg, metadata, lightPixels) = XisfIO.loadImageWithPixels lightPath
+                                                  |> AsyncResult.mapError (InputValidation << InputValidationError.InputNotFound << string)
 
         // Validate dimensions
-        match validateDimensions masters width height channels with
-        | Error msg -> failwith msg
-        | Ok () -> ()
+        let! _ = validateDimensions masters metadata.Width metadata.Height metadata.Channels
+                 |> Result.mapError ValidationFailed
+                 |> AsyncResult.ofResult
 
-        let pixelCount = width * height * channels
+        let pixelCount = metadata.Width * metadata.Height * metadata.Channels
 
         // Determine output format (use override, or max precision of all inputs)
         let (outputFmt, normalize) =
@@ -270,11 +218,8 @@ let calibrateImage (lightPath: string) (masters: MasterFrames) (calConfig: Calib
             | Some fmt -> PixelIO.getRecommendedOutputFormat fmt
             | None ->
                 // Select most precise format from light frame and all masters
-                let bestFormat = maxPrecisionFormat [lightImg.SampleFormat; masters.MaxPrecisionFormat]
+                let bestFormat = maxPrecisionFormat [metadata.Format; masters.MaxPrecisionFormat]
                 PixelIO.getRecommendedOutputFormat bestFormat
-
-        // Read light pixels
-        let lightPixels = PixelIO.readPixelsAsFloat lightImg
 
         // Calibrate pixels (dark optimization happens inside if enabled)
         let result = calibratePixels lightPixels masters calConfig
@@ -288,44 +233,48 @@ let calibrateImage (lightPath: string) (masters: MasterFrames) (calConfig: Calib
         // Convert to output format
         let calibratedData = PixelIO.writePixelsFromFloat result.CalibratedPixels outputFmt normalize
 
-        let calibratedImg = createCalibratedImage lightImg calibratedData calConfig outputFmt result.DarkScale
+        // Build history
+        let historyEntries =
+            let baseHistory = buildCalibrationHistory calConfig
+            if calConfig.OptimizeDark then
+                baseHistory @ [sprintf "Dark scale factor: %.6f" result.DarkScale]
+            else
+                baseHistory
+
+        // Build calibration properties
+        let calibrationProps = buildCalibrationProperties calConfig result.DarkScale
+
+        // Create output image
+        let! calibratedImg = XisfIO.createOutputImage lightImg calibratedData {
+                                 XisfIO.defaultOutputImageConfig with
+                                     Format = Some outputFmt
+                                     HistoryEntries = historyEntries
+                                     AdditionalProps = Array.ofList calibrationProps
+                             }
+                             |> Result.mapError (ValidationFailed << string)
+                             |> AsyncResult.ofResult
+
         return (calibratedImg, result.DarkScale)
     }
 
-let processFile (filePath: string) (masters: MasterFrames) (cmdConfig: CalibrateCommandConfig) : Async<Result<string, string>> =
-    async {
-        try
-            let fileName = Path.GetFileNameWithoutExtension(filePath)
-            let ext = Path.GetExtension(filePath)
-            let outputFileName = fileName + cmdConfig.Suffix + ext
-            let outputPath = Path.Combine(cmdConfig.OutputDir, outputFileName)
+let processFile (filePath: string) (outputPaths: string list) (masters: MasterFrames * CalibrateCommandConfig) : Async<Result<unit, CalibrateError>> =
+    asyncResult {
+        let (masterFrames, cmdConfig) = masters
+        let outputPath = List.head outputPaths
 
-            if not cmdConfig.Overwrite && File.Exists(outputPath) then
-                Log.Warning("Output file exists, skipping (use --overwrite to replace): {Path}", outputPath)
-                return Ok filePath
+        if cmdConfig.DryRun then
+            if cmdConfig.Overwrite && File.Exists(outputPath) then
+                Log.Information("[DRY RUN] Would overwrite: {Path}", outputPath)
             else
-                if cmdConfig.DryRun then
-                    if cmdConfig.Overwrite && File.Exists(outputPath) then
-                        Log.Information("[DRY RUN] Would overwrite: {Path}", outputPath)
-                    else
-                        Log.Information("[DRY RUN] Would create: {Path}", outputPath)
-                    return Ok filePath
-                else
-                    Log.Information("Calibrating: {File}", Path.GetFileName(filePath))
+                Log.Information("[DRY RUN] Would create: {Path}", outputPath)
+        else
+            Log.Information("Calibrating: {File}", Path.GetFileName(filePath))
 
-                    let calConfig = toCalibrationConfig cmdConfig
-                    let! (calibratedImage, _darkScale) = calibrateImage filePath masters calConfig cmdConfig.OutputFormat
+            let calConfig = toCalibrationConfig cmdConfig
+            let! (calibratedImage, _darkScale) = calibrateImage filePath masterFrames calConfig cmdConfig.OutputFormat
 
-                    let metadata = XisfFactory.CreateMinimalMetadata("XisfPrep Calibrate v1.0")
-                    let outUnit = XisfFactory.CreateMonolithic(metadata, calibratedImage)
-
-                    let writer = new XisfWriter()
-                    do! writer.WriteAsync(outUnit, outputPath) |> Async.AwaitTask
-
-                    return Ok filePath
-        with ex ->
-            Log.Error("Failed to process {File}: {Error}", Path.GetFileName(filePath), ex.Message)
-            return Error ex.Message
+            do! XisfIO.writeImage outputPath "XisfPrep Calibrate v1.0" calibratedImage
+                |> AsyncResult.mapError (InputValidation << InputValidationError.InputNotFound << string)
     }
 
 let run (args: string array) =
@@ -364,31 +313,26 @@ let run (args: string array) =
                     return 1
                 | Ok masters ->
 
-                // Create output directory
-                if not config.DryRun && not (Directory.Exists(config.OutputDir)) then
-                    Directory.CreateDirectory(config.OutputDir) |> ignore
-                    Log.Information("Created output directory: {Dir}", config.OutputDir)
+                // Build batch config
+                let batchConfig: SharedInfra.BatchProcessing.BatchConfig<MasterFrames * CalibrateCommandConfig> = {
+                    Files = files
+                    OutputDir = config.OutputDir
+                    Suffix = config.Suffix
+                    Overwrite = config.Overwrite
+                    MaxParallel = config.MaxParallel
+                    Config = (masters, config)
+                }
 
-                // Process files in parallel
-                let! results =
-                    files
-                    |> Array.map (fun file -> processFile file masters config)
-                    |> Async.Parallel
+                // Build output paths function
+                let buildOutputPaths baseName suffix outputDir =
+                    if config.DryRun then
+                        Some [Path.Combine(outputDir, $"{baseName}{suffix}.xisf")]
+                    else
+                        Some [Path.Combine(outputDir, $"{baseName}{suffix}.xisf")]
 
-                let successes = results |> Array.filter (function Ok _ -> true | Error _ -> false)
-                let failures = results |> Array.filter (function Error _ -> true | Ok _ -> false)
+                // Process batch
+                return! SharedInfra.BatchProcessing.processBatch batchConfig buildOutputPaths processFile
 
-                printfn ""
-                if config.DryRun then
-                    printfn "Dry run complete - no files were modified"
-                else
-                    printfn "Successfully calibrated %d of %d file%s" successes.Length files.Length plural
-
-                if failures.Length > 0 then
-                    printfn "Failed to process %d file%s" failures.Length (if failures.Length = 1 then "" else "s")
-                    return 1
-                else
-                    return 0
             with ex ->
                 Log.Error("Error: {Message}", ex.Message)
                 printfn ""
