@@ -24,6 +24,7 @@
     <Compile Include="Algorithms\RBFTransform.fs" />
     <Compile Include="Algorithms\Alignment.fs" />
     <Compile Include="Algorithms\HotPixelCorrection.fs" />
+    <Compile Include="Algorithms\Self2SelfDenoise.fs" />
     <Compile Include="Commands\SharedInfra.fs" />
     <Compile Include="Commands\Calibrate.fs" />
     <Compile Include="Commands\Debayer.fs" />
@@ -36,6 +37,7 @@
     <Compile Include="Commands\Convert.fs" />
     <Compile Include="Commands\Bin.fs" />
     <Compile Include="Commands\HotPixel.fs" />
+    <Compile Include="Commands\Denoise.fs" />
     <Compile Include="Commands\Inspect.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
@@ -44,6 +46,7 @@
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.1.0" />
     <PackageReference Include="Serilog" Version="4.3.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.1" />
   </ItemGroup>
 
   <ItemGroup>

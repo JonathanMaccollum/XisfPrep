@@ -53,6 +53,7 @@ let commandHandlers =
         "convert", Commands.Convert.run
         "bin", Commands.Bin.run
         "hotpixel", Commands.HotPixel.run
+        "denoise", Commands.Denoise.run
         "inspect", Commands.Inspect.run
     ]
 
