@@ -4,17 +4,7 @@ open System
 open System.IO
 open Serilog
 open XisfLib.Core
-
-// Constants
-let VNG_KERNEL_BORDER = 2  // 5x5 kernel requires 2-pixel margin from image edges
-
-// Color channel indices
-type Channel = R = 0 | G = 1 | B = 2
-
-// Eight gradient directions for VNG
-type Direction = N | NE | E | SE | S | SW | W | NW
-
-let allDirections = [| N; NE; E; SE; S; SW; W; NW |]
+open Algorithms.Debayering
 
 // --- Defaults ---
 let private defaultPattern = "RGGB"
@@ -116,140 +106,29 @@ let parseArgs (args: string array) : DebayerOptions =
 
     opts
 
-// Extract bayer pattern from image
-let getBayerPattern (img: XisfImage) (patternOverride: string option) =
-    match patternOverride with
-    | Some p -> p
-    | None ->
-        if isNull img.AssociatedElements then defaultPattern
-        else
-            img.AssociatedElements :> seq<_>
-            |> Seq.toArray
-            |> Array.tryPick (fun e ->
-                if e :? XisfFitsKeyword then
-                    let fits = e :?> XisfFitsKeyword
-                    if fits.Name = "BAYERPAT" then Some (fits.Value.Trim([|'\''|])) else None
-                else None)
-            |> Option.defaultValue defaultPattern
+// Extract bayer pattern string from FITS keyword and parse to BayerPattern type
+let parseBayerPattern (img: XisfImage) (patternOverride: string option) : BayerPattern =
+    let patternStr =
+        match patternOverride with
+        | Some p -> p
+        | None ->
+            if isNull img.AssociatedElements then defaultPattern
+            else
+                img.AssociatedElements :> seq<_>
+                |> Seq.toArray
+                |> Array.tryPick (fun e ->
+                    if e :? XisfFitsKeyword then
+                        let fits = e :?> XisfFitsKeyword
+                        if fits.Name = "BAYERPAT" then Some (fits.Value.Trim([|'\''|])) else None
+                    else None)
+                |> Option.defaultValue defaultPattern
 
-// Bayer pattern positions: RGGB = R at (0,0), G at (0,1) and (1,0), B at (1,1)
-let getColor x y pattern : Channel =
-    let evenRow = y % 2 = 0
-    let evenCol = x % 2 = 0
-    match pattern with
-    | "RGGB" ->
-        if evenRow && evenCol then Channel.R
-        elif evenRow && not evenCol then Channel.G
-        elif not evenRow && evenCol then Channel.G
-        else Channel.B
-    | "BGGR" ->
-        if evenRow && evenCol then Channel.B
-        elif evenRow && not evenCol then Channel.G
-        elif not evenRow && evenCol then Channel.G
-        else Channel.R
-    | "GRBG" ->
-        if evenRow && evenCol then Channel.G
-        elif evenRow && not evenCol then Channel.R
-        elif not evenRow && evenCol then Channel.B
-        else Channel.G
-    | "GBRG" ->
-        if evenRow && evenCol then Channel.G
-        elif evenRow && not evenCol then Channel.B
-        elif not evenRow && evenCol then Channel.R
-        else Channel.G
-    | _ -> failwith "Unknown bayer pattern"
-
-// Compute gradient magnitude in a direction using 5x5 neighborhood
-let computeGradient (getPixel: int -> int -> float) x y dir =
-    let inline diff a b = abs (a - b)
-    match dir with
-    | N  -> diff (getPixel x (y-1)) (getPixel x (y+1)) + diff (getPixel x (y-2)) (getPixel x y)
-    | NE -> diff (getPixel (x+1) (y-1)) (getPixel (x-1) (y+1)) + diff (getPixel (x+2) (y-2)) (getPixel x y)
-    | E  -> diff (getPixel (x+1) y) (getPixel (x-1) y) + diff (getPixel (x+2) y) (getPixel x y)
-    | SE -> diff (getPixel (x+1) (y+1)) (getPixel (x-1) (y-1)) + diff (getPixel (x+2) (y+2)) (getPixel x y)
-    | S  -> diff (getPixel x (y+1)) (getPixel x (y-1)) + diff (getPixel x (y+2)) (getPixel x y)
-    | SW -> diff (getPixel (x-1) (y+1)) (getPixel (x+1) (y-1)) + diff (getPixel (x-2) (y+2)) (getPixel x y)
-    | W  -> diff (getPixel (x-1) y) (getPixel (x+1) y) + diff (getPixel (x-2) y) (getPixel x y)
-    | NW -> diff (getPixel (x-1) (y-1)) (getPixel (x+1) (y+1)) + diff (getPixel (x-2) (y-2)) (getPixel x y)
-
-// Helper to average values, with a fallback to a simple average if no valid directions are found
-let average (values: float array) =
-    if values.Length > 0 then Array.average values
-    else 0.0
-
-let getFallback (fallbackValues: float array) =
-    if fallbackValues.Length > 0 then Array.average fallbackValues
-    else 0.0
-
-
-// VNG (Variable Number of Gradients) interpolation for interior pixels
-let interpolateVNG (getPixel: int -> int -> float) x y (color: Channel) (value: float) bayerPattern =
-    let gradients = allDirections |> Array.map (fun dir -> (dir, computeGradient getPixel x y dir))
-    let minGrad = gradients |> Array.map snd |> Array.min
-    let maxGrad = gradients |> Array.map snd |> Array.max
-    let threshold = minGrad + (maxGrad - minGrad) / 2.0
-    let validDirs = gradients |> Array.filter (fun (_, g) -> g <= threshold) |> Array.map fst
-    let validDirsSet = Set.ofArray validDirs
-
-    match color with
-    | Channel.R ->
-        // Red pixel - interpolate G and B
-        // G-neighbors are at N, S, E, W
-        let gDirs = [| N; E; S; W |]
-        let gFallbacks = gDirs |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-        let gValues = gDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-
-        // B-neighbors are at NE, SE, SW, NW
-        let bDirs = [| NE; SE; SW; NW |]
-        let bFallbacks = bDirs |> Array.map (fun dir -> match dir with NE -> getPixel (x+1) (y-1) | SE -> getPixel (x+1) (y+1) | SW -> getPixel (x-1) (y+1) | _ -> getPixel (x-1) (y-1))
-        let bValues = bDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with NE -> getPixel (x+1) (y-1) | SE -> getPixel (x+1) (y+1) | SW -> getPixel (x-1) (y+1) | _ -> getPixel (x-1) (y-1))
-
-        let g = if gValues.Length > 0 then average gValues else getFallback gFallbacks
-        let b = if bValues.Length > 0 then average bValues else getFallback bFallbacks
-        (value, g, b)
-
-    | Channel.B ->
-        // Blue pixel - interpolate G and R
-        // G-neighbors are at N, S, E, W
-        let gDirs = [| N; E; S; W |]
-        let gFallbacks = gDirs |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-        let gValues = gDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-
-        // R-neighbors are at NE, SE, SW, NW
-        let rDirs = [| NE; SE; SW; NW |]
-        let rFallbacks = rDirs |> Array.map (fun dir -> match dir with NE -> getPixel (x+1) (y-1) | SE -> getPixel (x+1) (y+1) | SW -> getPixel (x-1) (y+1) | _ -> getPixel (x-1) (y-1))
-        let rValues = rDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with NE -> getPixel (x+1) (y-1) | SE -> getPixel (x+1) (y+1) | SW -> getPixel (x-1) (y+1) | _ -> getPixel (x-1) (y-1))
-
-        let g = if gValues.Length > 0 then average gValues else getFallback gFallbacks
-        let r = if rValues.Length > 0 then average rValues else getFallback rFallbacks
-        (r, g, value)
-
-    | Channel.G ->
-        // Green pixel - interpolate R and B
-        // Determine which neighbors are R and which are B based on Bayer pattern
-        let (rDirs, bDirs) =
-            match bayerPattern with
-            // For RGGB, G on R-row (y%2=0) has R neighbors E/W, B neighbors N/S
-            | "RGGB" -> if y % 2 = 0 then ([| E; W |], [| N; S |]) else ([| N; S |], [| E; W |])
-            // For BGGR, G on B-row (y%2=0) has B neighbors E/W, R neighbors N/S
-            | "BGGR" -> if y % 2 = 0 then ([| N; S |], [| E; W |]) else ([| E; W |], [| N; S |])
-            // For GRBG, G on G-row (y%2=0) has R neighbors N/S, B neighbors E/W
-            | "GRBG" -> if y % 2 = 0 then ([| N; S |], [| E; W |]) else ([| E; W |], [| N; S |])
-            // For GBRG, G on G-row (y%2=0) has B neighbors N/S, R neighbors E/W
-            | "GBRG" -> if y % 2 = 0 then ([| E; W |], [| N; S |]) else ([| N; S |], [| E; W |])
-            | _ -> failwith "Unknown bayer pattern"
-
-        let rFallbacks = rDirs |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-        let rValues = rDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-
-        let bFallbacks = bDirs |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-        let bValues = bDirs |> Array.filter (fun d -> validDirsSet.Contains d) |> Array.map (fun dir -> match dir with N -> getPixel x (y-1) | E -> getPixel (x+1) y | S -> getPixel x (y+1) | _ -> getPixel (x-1) y)
-
-        let r = if rValues.Length > 0 then average rValues else getFallback rFallbacks
-        let b = if bValues.Length > 0 then average bValues else getFallback bFallbacks
-        (r, value, b)
-
-    | _ -> failwith "Invalid channel"
+    match patternStr.ToUpper() with
+    | "RGGB" -> BayerPattern.RGGB
+    | "BGGR" -> BayerPattern.BGGR
+    | "GRBG" -> BayerPattern.GRBG
+    | "GBRG" -> BayerPattern.GBRG
+    | _ -> failwithf "Unknown Bayer pattern: %s" patternStr
 
 let debayerImage (inputPath: string) (outputDir: string) (patternOverride: string option) (suffix: string) (overwrite: bool) (outputFormatOverride: XisfSampleFormat option) (split: bool) : Async<bool> =
     async {
@@ -290,53 +169,31 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
             | Ok (img, metadata, pixelFloats) ->
 
             // Validate that image is monochrome (single channel) before debayering
-            if metadata.Channels <> 1 then
-                Log.Error($"Cannot debayer '{fileName}': image has {metadata.Channels} channels (expected 1 for monochrome Bayer data)")
+            match validateMonochrome metadata.Channels with
+            | Error err ->
+                Log.Error($"Cannot debayer '{fileName}': {err}")
                 return false
-            elif img.ColorSpace = XisfColorSpace.RGB then
+            | Ok () ->
+
+            if img.ColorSpace = XisfColorSpace.RGB then
                 // Additional safety check: reject if already RGB color space
                 Log.Error($"Cannot debayer '{fileName}': image is already in RGB color space")
                 return false
             else
 
-            let bayerPattern = getBayerPattern img patternOverride
+            let bayerPattern = parseBayerPattern img patternOverride
 
             let width = metadata.Width
             let height = metadata.Height
 
-            let getPixel x y =
-                // Clamp coordinates to image bounds (replicate edge pixels)
-                let x' = max 0 (min (width - 1) x)
-                let y' = max 0 (min (height - 1) y)
-                pixelFloats.[y' * width + x']
+            let debayerConfig = { Pattern = bayerPattern }
 
-            // Output is 3 channels (RGB)
-            let debayeredFloats = Array.zeroCreate (width * height * 3)
-
-            // Pass 1: VNG interpolation for interior pixels
-            for y = VNG_KERNEL_BORDER to height - VNG_KERNEL_BORDER - 1 do
-                for x = VNG_KERNEL_BORDER to width - VNG_KERNEL_BORDER - 1 do
-                    let outIdx = (y * width + x) * 3
-                    let color = getColor x y bayerPattern
-                    let value = getPixel x y
-                    let r, g, b = interpolateVNG getPixel x y color value bayerPattern
-                    debayeredFloats.[outIdx + 0] <- r
-                    debayeredFloats.[outIdx + 1] <- g
-                    debayeredFloats.[outIdx + 2] <- b
-
-            // Pass 2: Edge replication for borders (copy nearest interior VNG result)
-            for y = 0 to height - 1 do
-                for x = 0 to width - 1 do
-                    let isBorder = x < VNG_KERNEL_BORDER || x >= width - VNG_KERNEL_BORDER ||
-                                   y < VNG_KERNEL_BORDER || y >= height - VNG_KERNEL_BORDER
-                    if isBorder then
-                        let outIdx = (y * width + x) * 3
-                        let srcX = max VNG_KERNEL_BORDER (min (width - VNG_KERNEL_BORDER - 1) x)
-                        let srcY = max VNG_KERNEL_BORDER (min (height - VNG_KERNEL_BORDER - 1) y)
-                        let srcIdx = (srcY * width + srcX) * 3
-                        debayeredFloats.[outIdx + 0] <- debayeredFloats.[srcIdx + 0]
-                        debayeredFloats.[outIdx + 1] <- debayeredFloats.[srcIdx + 1]
-                        debayeredFloats.[outIdx + 2] <- debayeredFloats.[srcIdx + 2]
+            // Call the debayering algorithm
+            match debayerPixels pixelFloats width height debayerConfig with
+            | Error err ->
+                Log.Error($"Debayering failed for '{fileName}': {err}")
+                return false
+            | Ok result ->
 
             // Determine output format (use override or preserve input format)
             let (outputFormat, normalize) =
@@ -351,20 +208,18 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
 
             if split then
                 // Split into three separate monochrome files
-                let channelNames = [| ("R", "Red"); ("G", "Green"); ("B", "Blue") |]
-                let pixelCount = width * height
+                let channels = [|
+                    ("R", "Red", result.RedChannel)
+                    ("G", "Green", result.GreenChannel)
+                    ("B", "Blue", result.BlueChannel)
+                |]
 
                 let! writeResults =
-                    channelNames
-                    |> Array.mapi (fun i (chSuffix, filterName) ->
+                    channels
+                    |> Array.map (fun (chSuffix, filterName, channelFloats) ->
                         async {
                             let outFileName = $"{baseName}{suffix}_{chSuffix}.xisf"
                             let outPath = Path.Combine(outputDir, outFileName)
-
-                            // Extract single channel from interleaved RGB data
-                            let channelFloats = Array.zeroCreate pixelCount
-                            for p in 0 .. pixelCount - 1 do
-                                channelFloats.[p] <- debayeredFloats.[p * 3 + i]
 
                             let channelBytes = PixelIO.writePixelsFromFloat channelFloats outputFormat normalize
 
@@ -400,11 +255,19 @@ let debayerImage (inputPath: string) (outputDir: string) (patternOverride: strin
                 return writeResults |> Array.forall id
 
             else
-                // Standard RGB output
+                // Standard RGB output - interleave the three channels
                 let outFileName = $"{baseName}{suffix}.xisf"
                 let outPath = Path.Combine(outputDir, outFileName)
 
-                let debayered = PixelIO.writePixelsFromFloat debayeredFloats outputFormat normalize
+                // Interleave R, G, B channels into single RGB array
+                let pixelCount = width * height
+                let rgbFloats = Array.zeroCreate (pixelCount * 3)
+                for i = 0 to pixelCount - 1 do
+                    rgbFloats.[i * 3 + 0] <- result.RedChannel.[i]
+                    rgbFloats.[i * 3 + 1] <- result.GreenChannel.[i]
+                    rgbFloats.[i * 3 + 2] <- result.BlueChannel.[i]
+
+                let debayered = PixelIO.writePixelsFromFloat rgbFloats outputFormat normalize
 
                 // Create output config excluding Bayer keywords
                 let outputConfig = {

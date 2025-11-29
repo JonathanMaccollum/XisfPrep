@@ -12,6 +12,8 @@
     <Compile Include="Algorithms\Statistics.fs" />
     <Compile Include="Algorithms\InputValidation.fs" />
     <Compile Include="Algorithms\Binning.fs" />
+    <Compile Include="Algorithms\DirectionalGradients.fs" />
+    <Compile Include="Algorithms\Debayering.fs" />
     <Compile Include="Algorithms\Calibration.fs" />
     <Compile Include="Algorithms\Painting.fs" />
     <Compile Include="Algorithms\OutputImage.fs" />
