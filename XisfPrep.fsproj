@@ -23,6 +23,7 @@
     <Compile Include="Algorithms\Interpolation.fs" />
     <Compile Include="Algorithms\RBFTransform.fs" />
     <Compile Include="Algorithms\Alignment.fs" />
+    <Compile Include="Algorithms\HotPixelCorrection.fs" />
     <Compile Include="Commands\SharedInfra.fs" />
     <Compile Include="Commands\Calibrate.fs" />
     <Compile Include="Commands\Debayer.fs" />
@@ -34,6 +35,7 @@
     <Compile Include="Commands\Stars.fs" />
     <Compile Include="Commands\Convert.fs" />
     <Compile Include="Commands\Bin.fs" />
+    <Compile Include="Commands\HotPixel.fs" />
     <Compile Include="Commands\Inspect.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

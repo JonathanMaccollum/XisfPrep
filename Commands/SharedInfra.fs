@@ -121,26 +121,30 @@ module ArgumentParsing =
     }
 
     /// Parse common flags and return remaining args + parsed options
-    let rec parseCommonFlags (args: string list) (opts: CommonOptions) : (string list * CommonOptions) =
-        match args with
-        | [] -> ([], opts)
-        | "--input" :: value :: rest | "-i" :: value :: rest ->
-            parseCommonFlags rest { opts with Input = value }
-        | "--output" :: value :: rest | "-o" :: value :: rest ->
-            parseCommonFlags rest { opts with Output = value }
-        | "--suffix" :: value :: rest ->
-            parseCommonFlags rest { opts with Suffix = value }
-        | "--overwrite" :: rest ->
-            parseCommonFlags rest { opts with Overwrite = true }
-        | "--parallel" :: value :: rest ->
-            parseCommonFlags rest { opts with MaxParallel = int value }
-        | "--output-format" :: value :: rest ->
-            match PixelIO.parseOutputFormat value with
-            | Some fmt -> parseCommonFlags rest { opts with OutputFormat = Some fmt }
-            | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
-        | remaining ->
-            // Not a common flag, return remaining args
-            (remaining, opts)
+    /// Scans entire argument list, allowing common flags in any position
+    let parseCommonFlags (args: string list) (opts: CommonOptions) : (string list * CommonOptions) =
+        let rec loop (args: string list) (opts: CommonOptions) (accumulated: string list) : (string list * CommonOptions) =
+            match args with
+            | [] -> (List.rev accumulated, opts)
+            | "--input" :: value :: rest | "-i" :: value :: rest ->
+                loop rest { opts with Input = value } accumulated
+            | "--output" :: value :: rest | "-o" :: value :: rest ->
+                loop rest { opts with Output = value } accumulated
+            | "--suffix" :: value :: rest ->
+                loop rest { opts with Suffix = value } accumulated
+            | "--overwrite" :: rest ->
+                loop rest { opts with Overwrite = true } accumulated
+            | "--parallel" :: value :: rest ->
+                loop rest { opts with MaxParallel = int value } accumulated
+            | "--output-format" :: value :: rest ->
+                match PixelIO.parseOutputFormat value with
+                | Some fmt -> loop rest { opts with OutputFormat = Some fmt } accumulated
+                | None -> failwithf "Unknown output format: %s (supported: uint8, uint16, uint32, float32, float64)" value
+            | head :: rest ->
+                // Not a common flag, accumulate and continue processing
+                loop rest opts (head :: accumulated)
+
+        loop args opts []
 
     /// Parse individual flag helpers (compositional approach)
 

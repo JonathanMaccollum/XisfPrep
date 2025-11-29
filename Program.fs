@@ -30,6 +30,7 @@ let showUsage() =
     printfn "  stars       Detect stars and generate visualization"
     printfn "  convert     Format conversion and export"
     printfn "  bin         Downsample images by binning pixels"
+    printfn "  hotpixel    Detect and correct hot/cold pixels"
     printfn "  inspect     Diagnostic inspection of XISF file structure"
     printfn ""
     printfn "Global options:"
@@ -51,6 +52,7 @@ let commandHandlers =
         "stars", Commands.Stars.run
         "convert", Commands.Convert.run
         "bin", Commands.Bin.run
+        "hotpixel", Commands.HotPixel.run
         "inspect", Commands.Inspect.run
     ]
 

@@ -270,6 +270,111 @@ dotnet run -- debayer -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\*_152
 
 ---
 
+## hotpixel
+
+### Basic Detection and Correction
+```bash
+# Single file with default settings (k=5.0)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT_2025-08-10_21-19-25_0000*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+
+# Multiple files with verbose logging
+dotnet run -- --verbose hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+
+# Process subset for testing
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT_2025-08-10_21-*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+```
+
+### Custom Thresholds
+```bash
+# More aggressive detection (lower k = more pixels flagged)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --k 3.0
+
+# Conservative detection (higher k = fewer pixels flagged)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --k 7.0
+
+# Asymmetric thresholds (more aggressive for hot pixels)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --k-hot 4.0 --k-cold 6.0
+```
+
+### Star Protection (Critical for Preserving Real Stars)
+```bash
+# Ratio-based protection (recommended, default ratio=1.5)
+# Protects stars by checking if pixel >> neighbors (hot pixels are 3-10x brighter)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --star-protection ratio
+
+# Custom ratio threshold for undersampled stars (all-sky, wide-field)
+# Lower ratio = more aggressive correction, but test PSF to ensure stars not damaged
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINACS\All-Sky\2025-11-17\*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --star-protection ratio --star-ratio 1.2 --bayer RGGB
+
+# Isolation-based protection (spatial filter: only corrects ≤1 bright neighbor)
+# May miss hot pixels near bright stars
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --star-protection isolation
+
+# No protection (testing/comparison - WILL damage stars!)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --star-protection none
+```
+
+**Star Protection Guide:**
+- **Ratio 1.5** (default): Safe for oversampled stars (FWHM >2.5px), excellent hot pixel removal
+- **Ratio 1.0-1.3**: Undersampled/all-sky images - TEST PSF first! May damage dim stars
+- **Ratio >2.0**: Very conservative, may leave hot pixels near stars
+- **Isolation**: Good star preservation but misses hot pixels adjacent to stars
+- **None**: No protection - use only for comparison or non-stellar data
+
+**IMPORTANT:** Always validate with PSF measurement (amplitude, FWHM, flux should be identical before/after)
+
+### Tiling Configuration
+```bash
+# Faster processing with less overlap (16px instead of default 24px)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --overlap 16
+
+# More overlap for better blending (32px)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --overlap 32
+```
+
+### Bayer/CFA Data
+```bash
+# Process CFA before debayering (recommended workflow)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINACS\All-Sky\2025-11-17\*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --bayer RGGB --star-protection ratio --star-ratio 1.2
+
+# Undersampled all-sky CFA - requires careful ratio tuning
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINACS\All-Sky\2025-11-17\All-Sky 2025-11-17__LIGHT_2025-11-18_00-19-51_15233_15.00s_4.80_0.00.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --bayer RGGB --star-protection ratio --star-ratio 1.1 --overlap 16
+```
+
+### Debayered RGB Data
+```bash
+# Process debayered RGB images (no --bayer flag)
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\*_d.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+```
+
+### Pipeline Integration
+```bash
+# Typical workflow: Calibrate → HotPixel → Debayer → Align
+# Step 1: Calibrate (if you have calibration frames)
+dotnet run -- calibrate -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --bias-level 100 --pedestal 50
+
+# Step 2: Hot/Cold pixel correction on calibrated Bayer data
+dotnet run -- hotpixel -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\*_cal.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --bayer RGGB
+
+# Step 3: Debayer
+dotnet run -- debayer -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\*_cal_corrected.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+```
+
+**Algorithm Details:**
+- 128×128 tile processing with configurable overlap
+- Local + global statistics (median, MAD) per color plane
+- VNG-style directional gradient interpolation (preserves edges)
+- Star protection via flux ratio or morphological isolation
+- Processes 2500+ tiles per 26MP image in ~12 seconds
+- Typical correction rate: 0.1-2% of pixels (depends on sensor/temperature)
+
+**XISF Metadata Written:**
+- Full processing parameters (k-hot, k-cold, star protection method/ratio, bayer pattern)
+- Correction statistics (total corrected, hot count, cold count)
+- Processing timestamp and version
+
+---
+
 ## integrate
 
 ### Basic Stacking (UInt16 - pending PixelIO update)

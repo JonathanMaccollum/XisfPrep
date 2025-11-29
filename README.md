@@ -5,6 +5,7 @@ Command-line tool for batch preprocessing astrophotography images in XISF format
 ## Features
 
 - **Calibrate** - Apply bias, dark, and flat calibration frames
+- **HotPixel** - Detect and correct hot/cold pixels with star protection
 - **Debayer** - Convert Bayer mosaic to RGB (VNG/bilinear)
 - **Align** - Register images using star detection and triangle matching
 - **Integrate** - Stack images with rejection and normalization
