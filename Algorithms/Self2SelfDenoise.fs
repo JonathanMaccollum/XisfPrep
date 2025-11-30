@@ -5,45 +5,67 @@ open TorchSharp
 open Serilog
 
 // ============================================================================
-// SIMPLE CNN DENOISER
+// U-NET DENOISER (DIRECT PREDICTION)
 // ============================================================================
 
-/// Simple CNN for denoising with normalized input/output
+/// Mini U-Net for Self2Self denoising. Predicts denoised IMAGE directly (not noise residual).
+/// Input: Z-score normalized tensor with masked pixels (Self2Self dropout)
+/// Output: Predicted denoised image in Z-score space (linear, unbounded)
+/// Architecture: Encoder → Bottleneck → Decoder with skip connections
 type SimpleDenoiser(numLayers: int, numFilters: int) as this =
-    inherit torch.nn.Module<torch.Tensor, torch.Tensor>("SimpleDenoiser")
+    inherit torch.nn.Module<torch.Tensor, torch.Tensor>("SimpleUNet")
 
-    let normalizationFactor = 65535.0f
+    // Encoder: Extract features and downsample
+    let enc1: TorchSharp.Modules.Sequential =
+        torch.nn.Sequential(
+            torch.nn.Conv2d(1L, int64 numFilters, 3L, padding=1L),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(int64 numFilters, int64 numFilters, 3L, padding=1L),
+            torch.nn.ReLU()
+        )
 
-    let layers =
-        let modules = ResizeArray<torch.nn.Module<torch.Tensor, torch.Tensor>>()
+    let pool: TorchSharp.Modules.MaxPool2d = torch.nn.MaxPool2d(2L, 2L)
 
-        // First conv: 1 channel -> numFilters
-        modules.Add(torch.nn.Conv2d(1L, int64 numFilters, 3L, padding=1L))
-        modules.Add(torch.nn.ReLU())
+    // Bottleneck: Process at lower resolution with more channels
+    let bottleneck: TorchSharp.Modules.Sequential =
+        torch.nn.Sequential(
+            torch.nn.Conv2d(int64 numFilters, int64 (numFilters * 2), 3L, padding=1L),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(int64 (numFilters * 2), int64 (numFilters * 2), 3L, padding=1L),
+            torch.nn.ReLU()
+        )
 
-        // Middle layers
-        for _ in 2 .. numLayers - 1 do
-            modules.Add(torch.nn.Conv2d(int64 numFilters, int64 numFilters, 3L, padding=1L))
-            modules.Add(torch.nn.BatchNorm2d(int64 numFilters))
-            modules.Add(torch.nn.ReLU())
+    // Decoder: Upsample and combine with skip connection
+    let upsample: TorchSharp.Modules.Upsample = torch.nn.Upsample(scale_factor=[|2.0; 2.0|], mode=torch.UpsampleMode.Bilinear, align_corners=false)
 
-        // Final conv: numFilters -> 1 (predict denoised image in [0,1] range)
-        modules.Add(torch.nn.Conv2d(int64 numFilters, 1L, 3L, padding=1L))
-
-        torch.nn.Sequential(modules)
+    let dec1: TorchSharp.Modules.Sequential =
+        torch.nn.Sequential(
+            // Input: (numFilters*2 from bottleneck) + (numFilters from skip) = numFilters*3
+            torch.nn.Conv2d(int64 (numFilters * 3), int64 numFilters, 3L, padding=1L),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(int64 numFilters, 1L, 3L, padding=1L)
+            // NO Sigmoid - output is in Z-score space, can be any value
+        )
 
     do
         this.RegisterComponents()
 
     override _.forward(input) =
-        // Normalize input to [0, 1] range
-        let normalized = input / normalizationFactor
+        // Encoder
+        use e1 = enc1.forward(input)
+        use p1 = pool.forward(e1)
 
-        // Direct prediction: output denoised image in [0, 1] range
-        let denoisedNormalized = layers.forward(normalized)
+        // Bottleneck
+        use b = bottleneck.forward(p1)
 
-        // Denormalize back to original range
-        denoisedNormalized * normalizationFactor
+        // Decoder
+        use u1 = upsample.forward(b)
+
+        // Skip connection: concatenate along channel dimension
+        use cat = torch.cat([| u1; e1 |], 1L)
+
+        // Final prediction: denoised image in Z-score space
+        dec1.forward(cat)
 
 // ============================================================================
 // TRAINING CONFIG
@@ -56,6 +78,11 @@ type TrainingConfig = {
     LearningRate: float
     DropoutRate: float
     UseGpu: bool
+    PatchesPerEpoch: int      // Number of patches to extract per epoch
+    BatchSize: int             // Number of patches per training batch
+    ValidationSplit: float     // Fraction of patches for validation (e.g., 0.1)
+    CheckpointEvery: int       // Save checkpoint every N epochs
+    EarlyStoppingPatience: int // Stop if no improvement for N epochs
 }
 
 let defaultConfig = {
@@ -63,8 +90,13 @@ let defaultConfig = {
     NumLayers = 5
     NumFilters = 48
     LearningRate = 0.001
-    DropoutRate = 0.3
+    DropoutRate = 0.5
     UseGpu = true
+    PatchesPerEpoch = 200      // 200 patches per epoch (was 1!)
+    BatchSize = 16             // Process 16 patches at once
+    ValidationSplit = 0.1      // 10% for validation
+    CheckpointEvery = 50       // Save every 50 epochs
+    EarlyStoppingPatience = 100 // Stop if no improvement for 100 epochs
 }
 
 // ============================================================================
@@ -77,50 +109,101 @@ let private createDropoutMask (height: int64) (width: int64) (dropoutRate: float
     let threshold = TorchSharp.Scalar.op_Implicit(dropoutRate)
     randTensor.gt(threshold) // Returns 1 where pixel is kept, 0 where dropped
 
-/// Single training step with random masking (Self2Self)
-let private trainStep
+/// Train on a batch of patches with random masking (Self2Self)
+let private trainBatch
     (model: SimpleDenoiser)
     (optimizer: torch.optim.Optimizer)
-    (image: torch.Tensor)
-    (dropoutRate: float) =
+    (batchTensor: torch.Tensor)
+    (dropoutRate: float)
+    (debugFirstBatch: bool) =
 
     optimizer.zero_grad()
 
-    let height = image.shape.[2]
-    let width = image.shape.[3]
-    let device = image.device
+    let batchSize = batchTensor.shape.[0]
+    let height = batchTensor.shape.[2]
+    let width = batchTensor.shape.[3]
+    let device = batchTensor.device
 
-    // Create dropout mask: 1 = keep pixel, 0 = drop pixel
+    // Z-score normalization based on batch statistics (robust to astrophotography dynamic range)
+    use batchMean = batchTensor.mean()
+    use batchStd = batchTensor.std()
+    let epsilon = TorchSharp.Scalar.op_Implicit(1e-6f)
+    use stdWithEps = batchStd + epsilon
+    use normalized = (batchTensor - batchMean) / stdWithEps
+
+    // Create dropout masks for entire batch
     use keepMask = createDropoutMask height width dropoutRate device
+    use keepMaskBatch = keepMask.expand([|batchSize; 1L; height; width|])
 
-    // Mask input: drop some pixels (set to 0)
-    use maskedInput = image * keepMask
+    // Mask normalized input: dropped pixels set to 0 (Self2Self corruption)
+    use maskedInput = normalized * keepMaskBatch
 
-    // Forward pass: model tries to reconstruct full image from partial input
-    use output = model.forward(maskedInput)
+    // Forward pass: DIRECT PREDICTION of denoised image
+    // Model sees masked input and predicts what the full image should be
+    use predictedImage = model.forward(maskedInput)
 
-    // Compute MSE loss ONLY on dropped pixels (where keepMask = 0)
-    // This forces the model to predict dropped pixels from neighbors
-    use dropMask = keepMask.logical_not().to_type(torch.float32)
-    use diff = (output - image) * dropMask
+    // Compute MSE loss ONLY on dropped pixels
+    // Compare prediction to original (noisy) values at dropped locations
+    // (Self2Self: expectation of noise is the clean signal)
+    use dropMask = keepMaskBatch.logical_not().to_type(torch.float32)
+    use diff = (predictedImage - normalized) * dropMask
     let exponent = TorchSharp.Scalar.op_Implicit(2.0)
-    use pixelLoss = diff.pow(exponent).mean()
 
-    // Soft range penalty: encourage output to stay in [0, 65535] range (or [0, 1] normalized)
-    // This doesn't hard-clip, just guides the model during training
-    use outputNormalized = output / 65535.0f
-    use tooLow = outputNormalized.clamp_max(0.0f).pow(exponent)
-    use tooHigh = (outputNormalized - 1.0f).clamp_min(0.0f).pow(exponent)
-    use rangePenalty = (tooLow.mean() + tooHigh.mean()) * 10.0f
+    // Normalize loss by number of dropped pixels (not all pixels)
+    use squaredDiff = diff.pow(exponent)
+    use pixelLoss = squaredDiff.sum() / dropMask.sum()
 
-    // Total loss
-    use totalLoss = pixelLoss + rangePenalty
+    if debugFirstBatch then
+        Log.Information("  [DEBUG] Input range: [{Min:F2}, {Max:F2}]", batchTensor.min().ToSingle(), batchTensor.max().ToSingle())
+        Log.Information("  [DEBUG] Z-score stats: mean={Mean:F2}, std={Std:F2}", batchMean.ToSingle(), batchStd.ToSingle())
+        Log.Information("  [DEBUG] Normalized range: [{Min:F4}, {Max:F4}]", normalized.min().ToSingle(), normalized.max().ToSingle())
+        Log.Information("  [DEBUG] Predicted image range: [{Min:F4}, {Max:F4}]", predictedImage.min().ToSingle(), predictedImage.max().ToSingle())
+        Log.Information("  [DEBUG] Dropout mask sum: {Sum} / {Total} pixels", dropMask.sum().ToInt32(), dropMask.numel())
+        Log.Information("  [DEBUG] Loss value: {Loss:F8}", pixelLoss.ToSingle())
 
     // Backward pass
-    totalLoss.backward()
+    pixelLoss.backward()
     optimizer.step() |> ignore
 
-    pixelLoss.ToSingle()  // Return pixel loss for logging (not penalty)
+    pixelLoss.ToSingle()
+
+/// Validate on a batch of patches (no gradient update)
+let private validateBatch
+    (model: SimpleDenoiser)
+    (batchTensor: torch.Tensor)
+    (dropoutRate: float) =
+
+    let batchSize = batchTensor.shape.[0]
+    let height = batchTensor.shape.[2]
+    let width = batchTensor.shape.[3]
+    let device = batchTensor.device
+
+    use _ = torch.no_grad()
+
+    // Z-score normalization based on batch statistics
+    use batchMean = batchTensor.mean()
+    use batchStd = batchTensor.std()
+    let epsilon = TorchSharp.Scalar.op_Implicit(1e-6f)
+    use stdWithEps = batchStd + epsilon
+    use normalized = (batchTensor - batchMean) / stdWithEps
+
+    use keepMask = createDropoutMask height width dropoutRate device
+    use keepMaskBatch = keepMask.expand([|batchSize; 1L; height; width|])
+    use maskedInput = normalized * keepMaskBatch
+
+    // Forward pass: DIRECT PREDICTION
+    use predictedImage = model.forward(maskedInput)
+
+    // Compute MSE loss on dropped pixels only
+    use dropMask = keepMaskBatch.logical_not().to_type(torch.float32)
+    use diff = (predictedImage - normalized) * dropMask
+    let exponent = TorchSharp.Scalar.op_Implicit(2.0)
+
+    // Normalize by number of dropped pixels
+    use squaredDiff = diff.pow(exponent)
+    use pixelLoss = squaredDiff.sum() / dropMask.sum()
+
+    pixelLoss.ToSingle()
 
 /// Convert 1D float array (channel-planar) to 2D float32 array
 let private array1DTo2D (data: float[]) (width: int) (height: int) (channelIndex: int) : float32[,] =
@@ -167,34 +250,128 @@ let private patchToTensor (patch: float32[,]) (device: torch.Device) =
         .unsqueeze(0L)
         .unsqueeze(1L)
 
-/// Core training loop on random patches
-let private runTraining (model: SimpleDenoiser) (imageData2D: float32[,]) (config: TrainingConfig) (device: torch.Device) =
+/// Extract multiple random patches from image
+let private extractRandomPatches (imageData2D: float32[,]) (patchSize: int) (numPatches: int) (rng: Random) =
+    [| for _ in 1 .. numPatches do
+        yield extractRandomPatch imageData2D patchSize rng |]
+
+/// Create batch tensor from array of patches
+let private patchesToBatchTensor (patches: float32[,][]) (device: torch.Device) =
+    let batchSize = patches.Length
+    let patchSize = Array2D.length1 patches.[0]
+
+    use batchTensor = torch.zeros([| int64 batchSize; 1L; int64 patchSize; int64 patchSize |],
+                                   dtype=torch.ScalarType.Float32, device=device)
+
+    for i in 0 .. batchSize - 1 do
+        use patchTensor = patchToTensor patches.[i] device
+        batchTensor.[int64 i] <- patchTensor.squeeze(0L)
+
+    batchTensor.clone()
+
+/// Core training loop with batching, validation, and checkpointing
+let private runTraining (model: SimpleDenoiser) (imageData2D: float32[,]) (config: TrainingConfig) (device: torch.Device) (modelPath: string) =
     let patchSize = 512
     use optimizer = torch.optim.AdamW(model.parameters(), config.LearningRate)
     let rng = Random()
 
-    Log.Information("Training Self2Self model for {Epochs} epochs using {Size}x{Size} patches",
-                   config.NumEpochs, patchSize, patchSize)
-    model.train()
+    Log.Information("Production Self2Self Training:")
+    Log.Information("  Epochs: {Epochs}", config.NumEpochs)
+    Log.Information("  Patches per epoch: {Patches}", config.PatchesPerEpoch)
+    Log.Information("  Batch size: {BatchSize}", config.BatchSize)
+    Log.Information("  Patch size: {Size}×{Size}", patchSize, patchSize)
+    Log.Information("  Validation split: {Split:P0}", config.ValidationSplit)
+    Log.Information("  Total training samples per epoch: {Total}", config.PatchesPerEpoch * patchSize * patchSize)
 
-    for epoch in 1 .. config.NumEpochs do
-        let patch = extractRandomPatch imageData2D patchSize rng
-        use patchTensor = patchToTensor patch device
+    // Calculate train/val split
+    let numValPatches = int (float config.PatchesPerEpoch * config.ValidationSplit)
+    let numTrainPatches = config.PatchesPerEpoch - numValPatches
 
-        try
-            let loss = trainStep model optimizer patchTensor config.DropoutRate
+    Log.Information("  Training patches: {Train}, Validation patches: {Val}", numTrainPatches, numValPatches)
 
-            if epoch % 10 = 0 || epoch = 1 then
-                Log.Information("Epoch {Epoch}/{Total}: Loss = {Loss:F6}", epoch, config.NumEpochs, loss)
-        with ex ->
-            Log.Error("Training failed at epoch {Epoch}: {Error}", epoch, ex.Message)
-            Log.Error("Stack trace: {StackTrace}", ex.StackTrace)
-            reraise()
+    let mutable bestValLoss = System.Single.MaxValue
+    let mutable epochsSinceImprovement = 0
+    let mutable bestEpoch = 0
+    let mutable shouldStop = false
+    let mutable epoch = 1
 
-    Log.Information("Training complete")
+    while epoch <= config.NumEpochs && not shouldStop do
+        // Extract patches for this epoch
+        let allPatches = extractRandomPatches imageData2D patchSize config.PatchesPerEpoch rng
+        let trainPatches = allPatches.[0 .. numTrainPatches - 1]
+        let valPatches = allPatches.[numTrainPatches ..]
+
+        // Training phase
+        model.train()
+        let mutable trainLossSum = 0.0f
+        let mutable trainBatches = 0
+
+        for batchStart in 0 .. config.BatchSize .. numTrainPatches - 1 do
+            let batchEnd = min (batchStart + config.BatchSize - 1) (numTrainPatches - 1)
+            let batchPatches = trainPatches.[batchStart .. batchEnd]
+
+            use batchTensor = patchesToBatchTensor batchPatches device
+            let debugThisBatch = (epoch = 1 && trainBatches = 0)
+            let loss = trainBatch model optimizer batchTensor config.DropoutRate debugThisBatch
+
+            trainLossSum <- trainLossSum + loss
+            trainBatches <- trainBatches + 1
+
+        let avgTrainLoss = trainLossSum / float32 trainBatches
+
+        // Validation phase
+        model.eval()
+        let mutable valLossSum = 0.0f
+        let mutable valBatches = 0
+
+        for batchStart in 0 .. config.BatchSize .. numValPatches - 1 do
+            let batchEnd = min (batchStart + config.BatchSize - 1) (numValPatches - 1)
+            let batchPatches = valPatches.[batchStart .. batchEnd]
+
+            use batchTensor = patchesToBatchTensor batchPatches device
+            let loss = validateBatch model batchTensor config.DropoutRate
+
+            valLossSum <- valLossSum + loss
+            valBatches <- valBatches + 1
+
+        let avgValLoss = valLossSum / float32 valBatches
+
+        // Logging every epoch
+        Log.Information("Epoch {Epoch}/{Total}: TrainLoss={Train:F6}, ValLoss={Val:F6}",
+                       epoch, config.NumEpochs, avgTrainLoss, avgValLoss)
+
+        // Track best model
+        if avgValLoss < bestValLoss then
+            bestValLoss <- avgValLoss
+            bestEpoch <- epoch
+            epochsSinceImprovement <- 0
+
+            // Save best model
+            let bestModelPath = modelPath.Replace(".pt", "_best.pt")
+            model.save(bestModelPath) |> ignore
+            Log.Information("  → New best model! ValLoss={Loss:F6} (saved to {Path})", avgValLoss, System.IO.Path.GetFileName bestModelPath)
+        else
+            epochsSinceImprovement <- epochsSinceImprovement + 1
+
+        // Checkpoint saving
+        if epoch % config.CheckpointEvery = 0 then
+            let checkpointPath = modelPath.Replace(".pt", $"_epoch{epoch}.pt")
+            model.save(checkpointPath) |> ignore
+            Log.Information("  Checkpoint saved: {Path}", System.IO.Path.GetFileName checkpointPath)
+
+        // Early stopping
+        if epochsSinceImprovement >= config.EarlyStoppingPatience then
+            Log.Information("Early stopping: No improvement for {Patience} epochs", config.EarlyStoppingPatience)
+            Log.Information("Best validation loss: {Loss:F6} at epoch {Epoch}", bestValLoss, bestEpoch)
+            shouldStop <- true
+
+        epoch <- epoch + 1
+
+    Log.Information("Training complete!")
+    Log.Information("Best model: Epoch {Epoch}, ValLoss={Loss:F6}", bestEpoch, bestValLoss)
 
 /// Train new Self2Self model from scratch
-let trainModel (imageData: float[]) (width: int) (height: int) (config: TrainingConfig) : SimpleDenoiser =
+let trainModel (imageData: float[]) (width: int) (height: int) (config: TrainingConfig) (modelPath: string) : SimpleDenoiser =
 
     let imageData2D = array1DTo2D imageData width height 0
 
@@ -209,11 +386,11 @@ let trainModel (imageData: float[]) (width: int) (height: int) (config: Training
     let model = new SimpleDenoiser(config.NumLayers, config.NumFilters)
     model.``to``(device) |> ignore
 
-    runTraining model imageData2D config device
+    runTraining model imageData2D config device modelPath
     model
 
 /// Continue training existing model
-let continueTraining (existingModel: SimpleDenoiser) (imageData: float[]) (width: int) (height: int) (config: TrainingConfig) : SimpleDenoiser =
+let continueTraining (existingModel: SimpleDenoiser) (imageData: float[]) (width: int) (height: int) (config: TrainingConfig) (modelPath: string) : SimpleDenoiser =
 
     let imageData2D = array1DTo2D imageData width height 0
 
@@ -227,7 +404,7 @@ let continueTraining (existingModel: SimpleDenoiser) (imageData: float[]) (width
 
     existingModel.``to``(device) |> ignore
 
-    runTraining existingModel imageData2D config device
+    runTraining existingModel imageData2D config device modelPath
     existingModel
 
 /// Extract tile from image with bounds checking
@@ -263,9 +440,11 @@ let private padTile (tile: float32[,]) (targetSize: int) =
         Array2D.init targetSize targetSize (fun y x ->
             if y < height && x < width then tile.[y, x] else 0.0f)
 
-/// Process batch of tiles through model
+/// Process batch of tiles through model with Self2Self test-time averaging
 let private denoiseTileBatch (model: SimpleDenoiser) (tiles: TileInfo list) (tileSize: int) (device: torch.Device) =
     let batchSize = tiles.Length
+    let numPasses = 10  // Average 10 masked predictions per Self2Self paper
+    let dropoutRate = 0.5
 
     // Stack tiles into batch tensor [B, 1, tileSize, tileSize]
     // Pad edge tiles to ensure uniform size
@@ -277,9 +456,55 @@ let private denoiseTileBatch (model: SimpleDenoiser) (tiles: TileInfo list) (til
         use tileTensor = patchToTensor paddedTile device
         batchTensor.[int64 i] <- tileTensor.squeeze(0L)
 
-    // Process entire batch in one forward pass
     use _ = torch.no_grad()
-    use denoisedBatch = model.forward(batchTensor)
+
+    // Z-score normalization based on batch statistics (compute once, reuse for all passes)
+    use batchMean = batchTensor.mean()
+    use batchStd = batchTensor.std()
+    let epsilon = TorchSharp.Scalar.op_Implicit(1e-6f)
+    use stdWithEps = batchStd + epsilon
+    use normalized = (batchTensor - batchMean) / stdWithEps
+
+    // Self2Self inference: average multiple masked predictions
+    // Simple averaging strategy as per expert recommendation
+    use accumulator = torch.zeros_like(normalized)
+
+    let mutable passNum = 0
+    for _ in 1 .. numPasses do
+        passNum <- passNum + 1
+
+        // Create random dropout mask (same as training)
+        use keepMask = createDropoutMask (int64 tileSize) (int64 tileSize) dropoutRate device
+        use keepMaskBatch = keepMask.expand([| int64 batchSize; 1L; int64 tileSize; int64 tileSize |])
+
+        // Mask normalized input
+        use maskedInput = normalized * keepMaskBatch
+
+        // Forward pass: DIRECT PREDICTION of denoised image
+        use predictedImage = model.forward(maskedInput)
+
+        // DEBUG first pass of first batch
+        if passNum = 1 && batchSize > 0 then
+            Log.Information("  [INFERENCE DEBUG] Pass 1:")
+            Log.Information("    Input range: [{Min:F2}, {Max:F2}]", batchTensor.min().ToSingle(), batchTensor.max().ToSingle())
+            Log.Information("    Z-score stats: mean={Mean:F2}, std={Std:F2}", batchMean.ToSingle(), batchStd.ToSingle())
+            Log.Information("    Normalized range: [{Min:F4}, {Max:F4}]", normalized.min().ToSingle(), normalized.max().ToSingle())
+            Log.Information("    Predicted image range: [{Min:F4}, {Max:F4}]", predictedImage.min().ToSingle(), predictedImage.max().ToSingle())
+
+        // Accumulate predictions in Z-score space
+        accumulator.add_(predictedImage) |> ignore
+
+    // Average the predictions in Z-score space
+    let avgFactor = TorchSharp.Scalar.op_Implicit(float32 numPasses)
+    use denoisedNormalized = accumulator / avgFactor
+
+    // Denormalize to pixel space
+    use denoisedBatch = denoisedNormalized * batchStd + batchMean
+
+    Log.Information("  [INFERENCE DEBUG] After averaging:")
+    Log.Information("    Accumulator range: [{Min:F2}, {Max:F2}]", accumulator.min().ToSingle(), accumulator.max().ToSingle())
+    Log.Information("    Final output range: [{Min:F2}, {Max:F2}]", denoisedBatch.min().ToSingle(), denoisedBatch.max().ToSingle())
+
     use denoisedCpu = denoisedBatch.cpu()
 
     // Unpack results and crop back to original size

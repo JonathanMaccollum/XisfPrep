@@ -443,3 +443,63 @@ dotnet run -- calibrate -i "W:\Astrophotography\DarkLibrary\ZWO ASI533MM Pro\202
 ```
 
 **Expected:** No zero pixel warnings (PixelIO denormalizes Float32 [0,1] → [0,65535])
+
+
+
+## denoise
+
+### Self2Self Training Workflow (Experimental)
+
+**Recommended: Train on calibrated data for better results**
+
+```bash
+# Step 1: Calibrate training frame with matching dark/flat
+dotnet run -- calibrate -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT_2025-09-09_22-46-05_0004_720.00s_-0.00_High Gain 2CMS_0.34.xisf" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" -d "W:\Astrophotography\DarkLibrary\QHY268M\20230921.MasterDark.Gain.56.Offset.25.0C.46x720s.xisf" -f "W:\Astrophotography\950mm\Flats\20250517.Evening.MasterSkyFlat.Ha3nm.56.25.xisf" --suffix "_calibrated" --overwrite
+
+# Step 2: Train Self2Self model on calibrated frame (5000 epochs for convergence test)
+dotnet run -- denoise train -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\Sh2-108 Take 3_Ha3nm_LIGHT_2025-09-09_22-46-05_0004_720.00s_-0.00_High Gain 2CMS_0.34_calibrated.xisf" --model "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\ha_denoiser_calibrated.pt" --epochs 5000
+
+# Step 3a: Apply to training image (baseline sanity check)
+dotnet run -- denoise apply -i "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\Sh2-108 Take 3_Ha3nm_LIGHT_2025-09-09_22-46-05_0004_720.00s_-0.00_High Gain 2CMS_0.34_calibrated.xisf" --model "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\ha_denoiser_calibrated.pt" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs" --overwrite
+
+# Step 3b: Apply trained model to other images
+dotnet run -- denoise apply -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT*.xisf" --model "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\ha_denoiser_calibrated.pt" -o "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs"
+```
+
+### Training on Uncalibrated Data (Not Recommended)
+```bash
+# Train directly on raw frame (low SNR, high noise - poor results expected)
+dotnet run -- denoise train -i "D:\Backups\Camera\Dropoff\NINA\Sh2-108 Take 3_Ha3nm_LIGHT_2025-09-09_22-46-05_0004_720.00s_-0.00_High Gain 2CMS_0.34.xisf" --model "D:\Backups\Camera\Dropoff\NINACS\Testing\Outputs\ha_denoiser_raw.pt" --epochs 5000
+```
+
+### Training Parameters
+```bash
+# Custom training configuration
+dotnet run -- denoise train -i "path/to/calibrated.xisf" --model "model.pt" \
+  --epochs 100 \           # Number of training iterations
+  --layers 5 \             # CNN depth (default: 5)
+  --filters 48 \           # Filters per layer (default: 48)
+  --learning-rate 0.001 \  # AdamW learning rate (default: 0.001)
+  --dropout 0.3 \          # Masking dropout rate (default: 0.5)
+  --cpu                    # Force CPU training (default: GPU if available)
+```
+
+### Continue Training Existing Model
+```bash
+# Resume training on new/additional data
+dotnet run -- denoise train -i "another_calibrated.xisf" --model "ha_denoiser_calibrated.pt" --continue --epochs 1000
+```
+
+### Apply Model Options
+```bash
+# Apply with custom output suffix
+dotnet run -- denoise apply -i "lights/*.xisf" --model "model.pt" -o "denoised/" --suffix "_clean"
+
+# Force CPU inference
+dotnet run -- denoise apply -i "lights/*.xisf" --model "model.pt" -o "denoised/" --cpu
+
+# Overwrite existing outputs
+dotnet run -- denoise apply -i "lights/*.xisf" --model "model.pt" -o "denoised/" --overwrite
+```
+
+**Note:** Self2Self is experimental. See `Docs/NoiseReduction-DeepLearning.md` for research findings, limitations, and alternative approaches (Noise2Noise, Neighbor2Neighbor).

@@ -121,13 +121,13 @@ let trainMode (inputPath: string) (modelPath: string) (overwrite: bool) (continu
                 Log.Information("  Loading existing model to continue training...")
                 let existingModel = Algorithms.Self2SelfDenoise.loadModel modelPath config.NumLayers config.NumFilters
                 Log.Information("  Continuing Self2Self neural network training...")
-                Algorithms.Self2SelfDenoise.continueTraining existingModel pixels metadata.Width metadata.Height config
+                Algorithms.Self2SelfDenoise.continueTraining existingModel pixels metadata.Width metadata.Height config modelPath
             else
                 if modelExists then
                     Log.Information("  Overwriting existing model with new training...")
                 else
                     Log.Information("  Training new Self2Self neural network...")
-                Algorithms.Self2SelfDenoise.trainModel pixels metadata.Width metadata.Height config
+                Algorithms.Self2SelfDenoise.trainModel pixels metadata.Width metadata.Height config modelPath
 
         // Save model
         try
@@ -175,9 +175,40 @@ let applyToFile
         if metadata.Channels <> 1 then
             return! Error (NotMonoImage metadata.Channels)
 
+        // Calculate input stats
+        let inputMin = Array.min pixels
+        let inputMax = Array.max pixels
+        let inputMean = Array.average pixels
+        let sortedInput = Array.sort pixels
+        let inputMedian = sortedInput.[sortedInput.Length / 2]
+        let inputVariance = pixels |> Array.map (fun x -> (x - inputMean) ** 2.0) |> Array.average
+        let inputStdDev = sqrt inputVariance
+
+        Log.Information("  Input  Stats: Min={Min:F2}, Max={Max:F2}, Mean={Mean:F2}, Median={Median:F2}, StdDev={StdDev:F2}",
+                       inputMin, inputMax, inputMean, inputMedian, inputStdDev)
+
         // Apply model
-        Log.Verbose("  Applying denoising model...")
+        Log.Information("  Applying denoising model...")
         let denoisedPixels = Algorithms.Self2SelfDenoise.applyModel model pixels metadata.Width metadata.Height useGpu
+
+        // Calculate output stats
+        let outputMin = Array.min denoisedPixels
+        let outputMax = Array.max denoisedPixels
+        let outputMean = Array.average denoisedPixels
+        let sortedOutput = Array.sort denoisedPixels
+        let outputMedian = sortedOutput.[sortedOutput.Length / 2]
+        let outputVariance = denoisedPixels |> Array.map (fun x -> (x - outputMean) ** 2.0) |> Array.average
+        let outputStdDev = sqrt outputVariance
+
+        Log.Information("  Output Stats: Min={Min:F2}, Max={Max:F2}, Mean={Mean:F2}, Median={Median:F2}, StdDev={StdDev:F2}",
+                       outputMin, outputMax, outputMean, outputMedian, outputStdDev)
+
+        // Show changes
+        let meanChange = ((outputMean - inputMean) / inputMean) * 100.0
+        let medianChange = ((outputMedian - inputMedian) / inputMedian) * 100.0
+        let stdDevChange = ((outputStdDev - inputStdDev) / inputStdDev) * 100.0
+        Log.Information("  Changes: Mean={Mean:+0.0;-0.0}%, Median={Median:+0.0;-0.0}%, StdDev={StdDev:+0.0;-0.0}%",
+                       meanChange, medianChange, stdDevChange)
 
         // Prepare output
         let (outputFormat, normalize) =
